@@ -37,7 +37,7 @@ from pipeline import (
     SwitchCausalInferencePipeline
 )
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
-from one_logger_utils import OneLoggerUtils
+# from one_logger_utils import OneLoggerUtils
 import time
 
 class Trainer:
@@ -69,6 +69,9 @@ class Trainer:
         set_seed(config.seed + global_rank)
 
         self.use_one_logger = getattr(config, "use_one_logger", True)
+        if self.use_one_logger:
+            self.use_one_logger = False
+            print("One Logger is currently disabled.")
         if self.is_main_process and not self.disable_wandb:
             wandb.login(
                 # host=config.wandb_host,
