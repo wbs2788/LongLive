@@ -14,8 +14,10 @@ from utils.misc import (
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from model import DMD, DMDSwitch
+from model import DMD, DMDSwitch, DMDGRPOVQJ
 from model.streaming_training import StreamingTrainingModel
+from model.dmd_grpo_vqj import GRPOConfig, VideoQAJudge
+
 import torch
 import wandb
 import time
@@ -39,7 +41,7 @@ from pipeline import (
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
 # from one_logger_utils import OneLoggerUtils
 import time
-
+import hashlib
 class Trainer:
     
     def __init__(self, config):
@@ -134,6 +136,21 @@ class Trainer:
             self.model = DMD(config, device=self.device)
         elif config.distribution_loss == "dmd_switch":
             self.model = DMDSwitch(config, device=self.device)
+        elif config.distribution_loss == "dmd_grpo_vqj":
+
+            if getattr(config, "use_grpo", False):
+                # Build judge and GRPO config
+                vqj = self._build_vqj(config)
+                grpo_cfg = GRPOConfig(
+                    group_size=getattr(config.grpo, "group_size", 4),
+                    beta=getattr(config.grpo, "beta", 6.0),
+                    alpha=getattr(config.grpo, "alpha", 0.5),
+                    clip_c=getattr(config.grpo, "clip_c", 0.25),
+                    use_ema_baseline=getattr(config.grpo, "use_ema_baseline", False),
+                )
+                self.model = DMDGRPOVQJ(config, device=self.device, vqj=vqj, grpo_cfg=grpo_cfg)
+            else:
+                self.model = DMDGRPOVQJ(config, device=self.device)
         elif config.distribution_loss == "dmd_window":
             self.model = DMDWindow(config, device=self.device)
         elif config.distribution_loss == "sid":
@@ -885,6 +902,54 @@ class Trainer:
 
         return critic_log_dict
 
+    def fwdbwd_one_step_grpo(self, batch):
+        """Run one GRPO-weighted DMD step for the generator on the first prompt in batch.
+        For simplicity we use the first prompt; you can loop over all prompts if resources allow."""
+        self.model.eval()  # keep deterministic modules stable
+
+        text_prompts = batch["prompts"]
+        prompt_text = text_prompts[0]
+        prompt_key = self._prompt_key(prompt_text)
+
+        # shape spec: the internal GRPO step will roll out G candidates itself,
+        # so here we set batch size to 1
+        image_or_video_shape = list(self.config.image_or_video_shape)
+        image_or_video_shape[0] = 1
+
+        with torch.no_grad():
+            conditional_dict = self.model.text_encoder(text_prompts=[prompt_text])
+            if not getattr(self, "unconditional_dict_single", None):
+                unconditional_dict = self.model.text_encoder(text_prompts=[self.config.negative_prompt])
+                unconditional_dict = {k: v.detach() for k, v in unconditional_dict.items()}
+                self.unconditional_dict_single = unconditional_dict
+            else:
+                unconditional_dict = self.unconditional_dict_single
+
+        # Prepare QA list for this prompt (replace with your own mapping)
+        qa_list = []  # e.g., self.qa_index.get(prompt_text_hash, [])
+
+        # === GRPO-weighted DMD ===
+        total_loss, grpo_log = self.model.grpo_weighted_dmd_step(
+            prompt_key=prompt_key,
+            image_or_video_shape=image_or_video_shape,
+            conditional_dict=conditional_dict,
+            unconditional_dict=unconditional_dict,
+            qa_list=qa_list,
+            initial_latents=None,
+            return_videos=False,
+        )
+
+        scaled = total_loss / self.gradient_accumulation_steps
+        scaled.backward()
+
+        # Return logs for wandb
+        grpo_log.update({
+            "generator_loss": total_loss.detach(),
+            "generator_grad_norm": torch.tensor(0.0, device=self.device),
+        })
+        return grpo_log
+
+
     def generate_video(self, pipeline, num_frames, prompts, image=None):
         batch_size = len(prompts)
         if image is not None:
@@ -1172,6 +1237,101 @@ class Trainer:
             
             return critic_log_dict
 
+    def fwdbwd_one_step_streaming_grpo(self):
+        """
+        GRPO-weighted streaming step for the generator.
+        - Branch from the same pre-chunk state G times to generate G candidates for the *same* next chunk.
+        - Judge each decoded candidate (pass-rate), compute advantages -> positive weights.
+        - Compute DMD loss per candidate via streaming_model.compute_generator_loss, take weighted sum, backward once.
+        - IMPORTANT: After backward, COMMIT the best rollout so streaming state & caches advance.
+
+        Returns:
+            log_dict, best_chunk_detached, best_info
+        """
+        assert getattr(self.config, "use_grpo", False)
+        self.model.eval()
+
+        if not self.streaming_active:
+            self.start_new_sequence()
+
+        G = getattr(self.config.grpo, "group_size", 4)
+        beta = getattr(self.config.grpo, "beta", 6.0)
+        alpha = getattr(self.config.grpo, "alpha", 0.5)
+        clip_c = getattr(self.config.grpo, "clip_c", 0.25)
+        use_ema_baseline = getattr(self.config.grpo, "use_ema_baseline", False)
+        judge_stride = self.config.grpo.get("judge_frame_stride", 2)
+
+        snap0 = self.streaming_model.get_snapshot()
+
+        seeds, pass_rates = [], []
+        for g in range(G):
+            self.streaming_model.load_snapshot(snap0)
+
+            seed = int(torch.randint(0, 2**31 - 1, (1,), device=self.device).item())
+            seeds.append(seed)
+            self._set_all_seeds(seed)
+
+            with torch.no_grad():
+                chunk, info = self.streaming_model.generate_next_chunk(requires_grad=False)
+                vid_cpu = self.streaming_model.decode_chunk_for_judge(
+                    chunk, frame_stride=judge_stride, to_cpu=True
+                )
+                qa_list = []
+                pr = float(self.model.vqj.score(vid_cpu, qa_list).get("pass_rate", 0.0))
+                pass_rates.append(pr)
+
+        R = torch.tensor(pass_rates, device=self.device, dtype=torch.float32)
+        if use_ema_baseline:
+            if not hasattr(self, "_ema_baseline"):
+                self._ema_baseline = {}
+            prompt_text = getattr(self, "current_prompt_text", None) or \
+                        self.streaming_model.state.get("prompt_text", "unknown_prompt")
+            key = self._prompt_key(prompt_text)
+            b_prev = self._ema_baseline.get(key, R.mean().item())
+            adv = R - b_prev
+            self._ema_baseline[key] = 0.9 * b_prev + 0.1 * R.mean().item()
+        else:
+            adv = R - R.mean()
+        if clip_c and clip_c > 0:
+            adv = torch.clamp(adv, -clip_c, clip_c)
+        weights = torch.sigmoid(beta * adv) * (1.0 - alpha) + alpha
+
+        total_loss_detached = 0.0
+        w_list = []
+        for g in range(G):
+            self.streaming_model.load_snapshot(snap0)
+            self._set_all_seeds(seeds[g])
+
+            chunk, info = self.streaming_model.generate_next_chunk(requires_grad=True)
+            loss_g, _ = self.streaming_model.compute_generator_loss(chunk=chunk, chunk_info=info)
+
+            w = weights[g]
+            (w * loss_g / self.gradient_accumulation_steps).backward()
+
+            total_loss_detached += (w * loss_g).detach().item()
+            w_list.append(w.detach())
+
+            del chunk, info, loss_g
+            torch.cuda.empty_cache()
+
+        best_idx = int(torch.argmax(R).item())
+        self.streaming_model.load_snapshot(snap0)
+        self._set_all_seeds(seeds[best_idx])
+        best_chunk, best_info = self.streaming_model.generate_next_chunk(requires_grad=False)
+
+        log = {
+            "generator_loss": torch.tensor(total_loss_detached, device=self.device),
+            "generator_grad_norm": torch.tensor(0.0, device=self.device),
+            "grpo_pass_rate_mean": R.mean().item(),
+            "grpo_pass_rate_std": (R.std(unbiased=False).item() if G > 1 else 0.0),
+            "grpo_weight_mean": torch.stack(w_list).mean().item(),
+            "grpo_weight_min": torch.stack(w_list).min().item(),
+            "grpo_weight_max": torch.stack(w_list).max().item(),
+            "grpo_best_idx": best_idx,
+            "grpo_best_pr": R[best_idx].item(),
+        }
+        return log, best_chunk.detach(), best_info
+
     def train(self):
         start_step = self.step
         try:
@@ -1206,16 +1366,47 @@ class Trainer:
                         
                         # Train generator (if needed)
                         if TRAIN_GENERATOR:
+                            use_grpo_now = getattr(self.config, "use_grpo", False) and \
+                                        (self.step % getattr(self.config.grpo, "every_n_steps", 4) == 0)
+
+                            if use_grpo_now:
+                                if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                                    print(f"[SeqTrain-Trainer] Accumulation: GRPO streaming step")
+
+                                # 1) GRPO
+                                gen_log, best_chunk, best_info = self.fwdbwd_one_step_streaming_grpo()
+                                accumulated_generator_logs.append(gen_log)
+
+                                # 2) Best trajectory to train critic
+                                crit_loss, crit_log = self.streaming_model.compute_critic_loss(
+                                    chunk=best_chunk, chunk_info=best_info
+                                )
+                                (crit_loss / self.gradient_accumulation_steps).backward()
+
+                                crit_log.update({
+                                    "critic_loss": crit_loss,
+                                    "critic_grad_norm": torch.tensor(0.0, device=self.device)
+                                })
+                                accumulated_critic_logs.append(crit_log)
+
+                            else:
+                                if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                                    print(f"[SeqTrain-Trainer] Accumulation: vanilla streaming generator step")
+
+                                gen_log = self.fwdbwd_one_step_streaming(True)
+                                accumulated_generator_logs.append(gen_log)
+
+                                crit_log = self.fwdbwd_one_step_streaming(False)
+                                accumulated_critic_logs.append(crit_log)
+
+                        else:
                             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                                print(f"[SeqTrain-Trainer] Accumulation step {accumulation_step + 1}: Training generator")
-                            extra_gen = self.fwdbwd_one_step_streaming(True)
-                            accumulated_generator_logs.append(extra_gen)
-                        
-                        # Train critic
-                        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                            print(f"[SeqTrain-Trainer] Accumulation step {accumulation_step + 1}: Training critic")
-                        extra_crit = self.fwdbwd_one_step_streaming(False)
-                        accumulated_critic_logs.append(extra_crit)
+                                print(f"[SeqTrain-Trainer] Accumulation: critic-only step")
+                            crit_log = self.fwdbwd_one_step_streaming(False)
+                            accumulated_critic_logs.append(crit_log)
+
+                        if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY and accumulation_step == 0:
+                            log_gpu_memory(f"streaming Training Step {self.step}: After whole-cycle forward/backward", device=self.device, rank=dist.get_rank())
                         
                         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY and accumulation_step == 0:
                             log_gpu_memory(f"streaming Training Step {self.step}: After whole-cycle forward/backward", device=self.device, rank=dist.get_rank())
@@ -1272,7 +1463,12 @@ class Trainer:
                         
                         # Train generator (if needed)
                         if TRAIN_GENERATOR:
-                            extra_gen = self.fwdbwd_one_step(batch, True)
+                            use_grpo_now = getattr(self.config, "use_grpo", False) and \
+                                        (self.step % getattr(self.config.grpo, "every_n_steps", 4) == 0)
+                            if use_grpo_now:
+                                extra_gen = self.fwdbwd_one_step_grpo(batch)
+                            else:
+                                extra_gen = self.fwdbwd_one_step(batch, True)  # 原来的 DMD generator step
                             accumulated_generator_logs.append(extra_gen)
                         
                         # Train critic
@@ -1320,45 +1516,64 @@ class Trainer:
                     self.save()
                     torch.cuda.empty_cache()
 
-                # Logging
-                if self.is_main_process:
-                    wandb_loss_dict = {}
-                    if TRAIN_GENERATOR and generator_log_dict:
-                        wandb_loss_dict.update(
-                            {
-                                "generator_loss": generator_log_dict["generator_loss"].mean().item(),
-                                "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
-                                "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
-                            }
-                        )
-
-
-                    wandb_loss_dict.update(
-                        {
-                            "critic_loss": critic_log_dict["critic_loss"].mean().item(),
-                            "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
-                        }
-                    )
-                    if not self.disable_wandb:
-                        wandb.log(wandb_loss_dict, step=self.step)
-
-                if self.step % self.config.gc_interval == 0:
-                    if dist.get_rank() == 0:
-                        logging.info("DistGarbageCollector: Running GC.")
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
+                # ---- Logging ----
                 if self.is_main_process:
                     current_time = time.time()
                     iteration_time = 0 if self.previous_time is None else current_time - self.previous_time
                     if not self.disable_wandb:
                         wandb.log({"per iteration time": iteration_time}, step=self.step)
+                        if self.is_main_process:
+                            wandb_loss_dict = {}
+
+                            # 把生成器/判别器的所有键都打上去（并集均值后的 dict）
+                            wandb_loss_dict.update(self._prefix_keys(generator_log_dict, "gen/"))
+                            wandb_loss_dict.update(self._prefix_keys(critic_log_dict, "crit/"))
+
+                            # GRPO 专属：如果存在就额外记录
+                            if "grpo_pass_rate_mean" in generator_log_dict:
+                                wandb_loss_dict["grpo/pass_rate_mean"] = generator_log_dict["grpo_pass_rate_mean"]
+                                wandb_loss_dict["grpo/pass_rate_std"] = generator_log_dict.get("grpo_pass_rate_std", 0.0)
+                                wandb_loss_dict["grpo/weight_mean"] = generator_log_dict.get("grpo_weight_mean", 0.0)
+                                wandb_loss_dict["grpo/weight_min"] = generator_log_dict.get("grpo_weight_min", 0.0)
+                                wandb_loss_dict["grpo/weight_max"] = generator_log_dict.get("grpo_weight_max", 0.0)
+                                wandb_loss_dict["grpo/best_idx"]  = generator_log_dict.get("grpo_best_idx", -1)
+                                wandb_loss_dict["grpo/best_pr"] = generator_log_dict.get("grpo_best_pr", 0.0)
+
+                                # 列表 -> 直方图（需要 wandb 已 import）
+                                prs = generator_log_dict.get("grpo_pass_rates", None)
+                                wts = generator_log_dict.get("grpo_weights", None)
+                                if prs:
+                                    wandb_loss_dict["grpo/pass_rates_hist"] = wandb.Histogram(prs)
+                                if wts:
+                                    wandb_loss_dict["grpo/weights_hist"] = wandb.Histogram(wts)
+
+                            if not self.disable_wandb:
+                                wandb.log(wandb_loss_dict, step=self.step)
                     self.previous_time = current_time
-                    # Log training progress
+
+                    # 取值时都用 get + _to_scalar，避免 KeyError / 类型不一致
+                    crit_loss_val = self._to_scalar(critic_log_dict.get("critic_loss"), 0.0)
+                    crit_gn_val   = self._to_scalar(critic_log_dict.get("critic_grad_norm"), 0.0)
+
                     if TRAIN_GENERATOR and generator_log_dict:
-                        print(f"step {self.step}, per iteration time {iteration_time}, generator_loss {generator_log_dict['generator_loss'].mean().item()}, generator_grad_norm {generator_log_dict['generator_grad_norm'].mean().item()}, dmdtrain_gradient_norm {generator_log_dict['dmdtrain_gradient_norm'].mean().item()}, critic_loss {critic_log_dict['critic_loss'].mean().item()}, critic_grad_norm {critic_log_dict['critic_grad_norm'].mean().item()}")
+                        gen_loss_val = self._to_scalar(generator_log_dict.get("generator_loss"), 0.0)
+                        gen_gn_val   = self._to_scalar(generator_log_dict.get("generator_grad_norm"), 0.0)
+                        # dmdtrain_gradient_norm 可能不存在；没有就用 generator_grad_norm 兜底
+                        dmd_gn_val   = self._to_scalar(
+                            generator_log_dict.get("dmdtrain_gradient_norm", generator_log_dict.get("generator_grad_norm")),
+                            0.0
+                        )
+                        print(
+                            f"step {self.step}, per iteration time {iteration_time}, "
+                            f"generator_loss {gen_loss_val}, generator_grad_norm {gen_gn_val}, "
+                            f"dmdtrain_gradient_norm {dmd_gn_val}, "
+                            f"critic_loss {crit_loss_val}, critic_grad_norm {crit_gn_val}"
+                        )
                     else:
-                        print(f"step {self.step}, per iteration time {iteration_time}, critic_loss {critic_log_dict['critic_loss'].mean().item()}, critic_grad_norm {critic_log_dict['critic_grad_norm'].mean().item()}")
+                        print(
+                            f"step {self.step}, per iteration time {iteration_time}, "
+                            f"critic_loss {crit_loss_val}, critic_grad_norm {crit_gn_val}"
+                        )
 
                 # ---------------------------------------- Visualization ---------------------------------------------------
 
@@ -1551,3 +1766,57 @@ class Trainer:
         torch.cuda.empty_cache()
         import gc
         gc.collect()
+
+    # --------------------------------------------------------------------------------------------------------------
+    # GRPO + VQJ helpers
+    # --------------------------------------------------------------------------------------------------------------
+
+    def _prompt_key(self, text: str) -> str:
+        """Stable key for a prompt (used as group baseline key).
+        You can also return dataset line-id if可获得."""
+        return hashlib.sha1(text.strip().encode("utf-8")).hexdigest()[:16]
+
+    def _build_vqj(self, config):
+        """Factory for Video-QA Judge. Replace DummyJudge with your Qwen-VL judge."""
+        # Option A: dummy judge to verify wiring
+        class DummyJudge(VideoQAJudge):
+            def score(self, video_rgb: torch.Tensor, qa_list):
+                # video_rgb: [T, 3, H, W] in [0,1]
+                # Return 0.0~1.0 pass-rate
+                # >>> Replace with your Qwen-VL based scorer
+                return {"pass_rate": 0.5, "items": []}
+
+        # Option B: load QA index for each prompt (if你要用静态 QA）
+        self.qa_index = {}
+        qa_path = getattr(config.grpo, "qa_index_jsonl", None)
+        if qa_path and os.path.exists(qa_path):
+            # Build prompt->QA list mapping if你把 prompt 文本也存进 JSONL
+            # 或 video_id->QA，再把 dataset 的 prompt 对应到同一 id
+            # 这里留空，由你根据数据写映射
+            pass
+
+        return DummyJudge()
+
+    def _set_all_seeds(self, seed: int):
+        import numpy as np, random, torch
+        random.seed(seed)
+        np.random.seed(seed % (2**32 - 1))
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    def _to_scalar(self, val, default=None):
+        if val is None:
+            return default
+        try:
+            import torch
+            if isinstance(val, (int, float)):
+                return float(val)
+            if torch.is_tensor(val):
+                return val.mean().item()
+        except Exception:
+            pass
+        # 兜底
+        return float(val) if val is not None else default
+
+    def _prefix_keys(self, d, prefix):
+        return {f"{prefix}{k}": v for k, v in d.items()}

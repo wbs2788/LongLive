@@ -2,5 +2,11 @@ __pycache__
 
 longlive_models
 wan_models
-
 videos
+logs
+long_logs
+checkpoints
+prompts
+vis
+wandb
+.vscode

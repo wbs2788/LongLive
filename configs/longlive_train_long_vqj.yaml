@@ -21,7 +21,7 @@ mixed_precision: true
 seed: 0
 wandb_key: 6ef5a682d0d509205b46bd6d1857abe4157aff2c
 wandb_entity: pasonwang
-wandb_project: longliveTest
+wandb_project: longliveVQJTest
 sharding_strategy: hybrid_full
 lr: 1.0e-05
 lr_critic: 2.0e-06
@@ -48,7 +48,7 @@ image_or_video_shape:
 - 16
 - 60
 - 104
-distribution_loss: dmd_switch
+distribution_loss: dmd_grpo_vqj
 global_sink: false
 trainer: score_distillation
 gradient_checkpointing: true
@@ -102,3 +102,16 @@ adapter:
   dtype: "bfloat16"          # Data type for LoRA parameters: "bfloat16", "float16", "float32"
   apply_to_critic: true       # Whether to apply LoRA to critic/fake_score model
   verbose: true              # Whether to print all target module names
+
+## GRPO Configuration
+use_grpo: true
+grpo:
+  group_size: 4           
+  beta: 6.0               
+  alpha: 0.5              
+  clip_c: 0.25            
+  use_ema_baseline: false
+  every_n_steps: 1        
+  judge_backend: "dummy"  
+  qa_index_jsonl: "/path/to/qa_all.jsonl"  
+  fps: 16
