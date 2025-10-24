@@ -786,3 +786,138 @@ class StreamingTrainingModel:
     def get_sequence_length(self) -> int:
         """Get current sequence length"""
         return self.state.get("current_length", 0) 
+    
+    # ========= GRPO helpers inside StreamingTrainingModel =========
+
+    def _clone_cache_block(self, block):
+        """Clone a single KV or Cross-Attn cache block (detach + clone)."""
+        if block is None:
+            return None
+        out = {}
+        for k, v in block.items():
+            if isinstance(v, torch.Tensor):
+                out[k] = v.detach().clone()
+            else:
+                out[k] = v
+        return out
+
+    def _clone_cache(self, cache_list):
+        """Deep clone a list[dict('k','v',...)] cache structure."""
+        if cache_list is None:
+            return None
+        return [self._clone_cache_block(b) for b in cache_list]
+
+    def _assign_cache(self, dst_list, src_list):
+        """
+        Assign src into dst (shape-compatible). If dst is None or shape mismatch,
+        simply replace the whole reference on pipeline.
+        """
+        if dst_list is None or src_list is None:
+            return src_list
+        # try in-place copy to avoid re-alloc
+        try:
+            for d, s in zip(dst_list, src_list):
+                for k in s.keys():
+                    if isinstance(s[k], torch.Tensor) and isinstance(d.get(k, None), torch.Tensor) \
+                    and d[k].shape == s[k].shape and d[k].dtype == s[k].dtype:
+                        d[k].data.copy_(s[k])
+                    else:
+                        d[k] = s[k]
+            return dst_list
+        except Exception:
+            return src_list
+
+    def get_snapshot(self):
+        """
+        Create a lightweight snapshot for branching.
+        Detach all tensors so new forward graphs won't keep references.
+        """
+        snap = {
+            "state": {
+                "current_length": self.state["current_length"],
+                "has_switched": self.state["has_switched"],
+                "previous_frames": None if self.state["previous_frames"] is None
+                                    else self.state["previous_frames"].detach().clone(),
+                "temp_max_length": self.state["temp_max_length"],
+                "conditional_info": self.state["conditional_info"],  # 只读 dict 可浅拷贝
+            },
+            "kv": None,
+            "xattn": None,
+            "pipe_pos": self.inference_pipeline.get_pos_snapshot() 
+                        if hasattr(self.inference_pipeline, "get_pos_snapshot") else None,
+        }
+        if self.inference_pipeline.kv_cache1 is not None:
+            kv_copy = []
+            for blk in self.inference_pipeline.kv_cache1:
+                kv_copy.append({
+                    "k": blk["k"].detach().clone(),
+                    "v": blk["v"].detach().clone(),
+                })
+            snap["kv"] = kv_copy
+
+        if self.inference_pipeline.crossattn_cache is not None:
+            xa_copy = []
+            for blk in self.inference_pipeline.crossattn_cache:
+                xa_copy.append({
+                    "k": blk["k"].detach().clone(),
+                    "v": blk["v"].detach().clone(),
+                })
+            snap["xattn"] = xa_copy
+        return snap
+
+    def load_snapshot(self, snap):
+        """
+        Restore a snapshot for branching. All cloned tensors are leaf tensors.
+        """
+        # Restore state (simple python objects + detached tensors)
+        s = snap["state"]
+        self.state["current_length"]  = s["current_length"]
+        self.state["has_switched"]    = s["has_switched"]
+        self.state["temp_max_length"] = s["temp_max_length"]
+        self.state["previous_frames"] = None if s["previous_frames"] is None \
+                                        else s["previous_frames"].detach().clone()
+        self.state["conditional_info"] = s["conditional_info"]
+
+        if snap["kv"] is not None:
+            for dst, src in zip(self.inference_pipeline.kv_cache1, snap["kv"]):
+                dst["k"] = src["k"].detach().clone()
+                dst["v"] = src["v"].detach().clone()
+        if snap["xattn"] is not None:
+            for dst, src in zip(self.inference_pipeline.crossattn_cache, snap["xattn"]):
+                dst["k"] = src["k"].detach().clone()
+                dst["v"] = src["v"].detach().clone()
+
+        if snap["pipe_pos"] is not None and hasattr(self.inference_pipeline, "load_pos_snapshot"):
+            self.inference_pipeline.load_pos_snapshot(snap["pipe_pos"])
+
+    def decode_chunk_for_judge(self, chunk, frame_stride: int = 2, to_cpu: bool = True):
+        """
+        Efficiently decode a chunk to sparse RGB frames for QA judging.
+
+        Args:
+            chunk: [B, F, C, H, W] latent (typically B=1)
+            frame_stride: subsample factor (decode every N frames)
+            to_cpu: move result to CPU
+
+        Returns:
+            video: [F', 3, H', W'] float32 in [0,1] on CPU (or GPU if to_cpu=False)
+        """
+        with torch.no_grad():
+            # Subsample frames to reduce decoding cost
+            sub = chunk[:, ::frame_stride, ...]
+            video = self.base_model.vae.decode_to_pixel(sub, use_cache=False)  # [-1,1]
+            video = (video * 0.5 + 0.5).clamp(0, 1)                           # [0,1]
+            video = video[0]  # B=1 -> [F', 3, H', W']
+            if to_cpu:
+                video = video.float().cpu()
+            return video
+
+    def judge_chunk_pass_rate(self, chunk, qa_list=None, frame_stride: int = 2) -> float:
+        """
+        Run your QA judge to get a pass rate for this chunk.
+        Replace `self.base_model.vqj.score(...)` with your own VLM/QA call if needed.
+        """
+        vid = self.decode_chunk_for_judge(chunk, frame_stride=frame_stride, to_cpu=True)  # [F',3,H',W'] on CPU
+        # Example: VideoQAJudge interface
+        judge_out = self.base_model.vqj.score(vid, qa_list or [])
+        return float(judge_out.get("pass_rate", 0.0))

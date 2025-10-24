@@ -19,9 +19,10 @@ guidance_scale: 3.0
 denoising_loss_type: flow
 mixed_precision: true
 seed: 0
-wandb_key: YOUR_WANDB_KEY
-wandb_entity: YOUR_WANDB_ENTITY
-wandb_project: YOUR_WANDB_PROJECT
+use_one_logger: false
+wandb_key: 6ef5a682d0d509205b46bd6d1857abe4157aff2c
+wandb_entity: pasonwang
+wandb_project: longliveTest
 sharding_strategy: hybrid_full
 lr: 2.0e-06
 lr_critic: 4.0e-07
