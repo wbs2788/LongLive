@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Project path and config
-CONFIG=configs/longlive_train_long_vqj.yaml
+CONFIG=configs/longlive_train_long_vqj_small.yaml
 LOGDIR=vqj_test_logs
 WANDB_SAVE_DIR=wandb
 echo "CONFIG="$CONFIG

@@ -408,7 +408,7 @@ class Trainer:
             self.one_logger.on_dataloader_init_start()
         if self.config.i2v:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
-        elif self.config.distribution_loss == "dmd_switch":
+        elif self.config.distribution_loss in ["dmd_switch", "dmd_grpo_vqj"]:
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
         else:
             dataset = TextDataset(config.data_path)
