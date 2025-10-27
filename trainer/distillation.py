@@ -433,7 +433,7 @@ class Trainer:
 
             if self.config.i2v:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
-            elif self.config.distribution_loss == "dmd_switch":
+            elif self.config.distribution_loss in ["dmd_switch", "dmd_grpo_vqj"]:
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
             else:
                 val_dataset = TextDataset(val_data_path)
