@@ -6,7 +6,7 @@ import random
 import re
 from pathlib import Path
 
-from utils.dataset import TextDataset, TwoTextDataset, cycle
+from utils.dataset import TextDataset, TwoTextDataset, cycle, TwoTextQADataset
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from utils.misc import (
     set_seed,
@@ -408,8 +408,14 @@ class Trainer:
             self.one_logger.on_dataloader_init_start()
         if self.config.i2v:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
-        elif self.config.distribution_loss in ["dmd_switch", "dmd_grpo_vqj"]:
+        elif self.config.distribution_loss == "dmd_switch":
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
+        elif self.config.distribution_loss == "dmd_grpo_vqj":
+            dataset = TwoTextQADataset(
+                config.data_path, config.switch_prompt_path,
+                qa_jsonl_path=config.jsonl_data_path,
+                qa_type_filter=getattr(config, "train_qa_type_filter", None)
+            )
         else:
             dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -435,6 +441,11 @@ class Trainer:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
             elif self.config.distribution_loss in ["dmd_switch", "dmd_grpo_vqj"]:
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
+            # elif self.config.distribution_loss == "dmd_grpo_vqj":
+            #     val_dataset = TwoTextQADataset(
+            #         qa_jsonl_path=val_data_path,
+            #         qa_type_filter=getattr(config, "val_qa_type_filter", None)
+            #     ) # Wait for evaluation code
             else:
                 val_dataset = TextDataset(val_data_path)
 
@@ -1033,6 +1044,21 @@ class Trainer:
         else:
             image_latent = None
 
+        # Get QA infos
+        video_id = None
+        if "video_id" in batch:
+            video_id = batch["video_id"][0] if isinstance(batch["video_id"], (list, tuple)) else batch["video_id"]
+        # qa: List[List[dict]] or List[dict]
+        qa_all = []
+        if "qa" in batch:
+            qa_field = batch["qa"]
+            # 若是 [List[dict], List[dict], ...] 取第一个样本；若已是 List[dict] 直接用
+            qa_all = qa_field[0] if (isinstance(qa_field, list) and len(qa_field) > 0 and isinstance(qa_field[0], dict) is False) else qa_field
+            # 规范化为 List[dict]
+            if qa_all and isinstance(qa_all[0], dict) is False and isinstance(qa_all[0], (list, tuple)):
+                # 防御式：万一外面 collate 成了嵌套
+                qa_all = list(qa_all[0])
+
         batch_size = len(text_prompts)
         image_or_video_shape = list(self.config.image_or_video_shape)
         image_or_video_shape[0] = batch_size
@@ -1114,6 +1140,13 @@ class Trainer:
         )
         
         self.streaming_active = True
+
+        st = self.streaming_model.state
+        st["video_id"] = video_id                          
+        st["qa"] = qa_all if qa_all is not None else []    # List[{"question","answer",...}]
+        st["qa_per_chunk"] = getattr(self.config.grpo, "qa_per_chunk", 6)
+        st["shuffle_qa"] = getattr(self.config.grpo, "shuffle_qa", True)
+
         
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[SeqTrain-Trainer] streaming training sequence setup completed")
@@ -1295,7 +1328,13 @@ class Trainer:
                 vid_cpu = self.streaming_model.decode_chunk_for_judge(
                     chunk, frame_stride=judge_stride, to_cpu=True
                 )
-                qa_list = []
+
+                qa_all = self.streaming_model.state.get("qa", [])
+                max_qs = int(self.streaming_model.state.get("qa_per_chunk", 6))
+                shuffle_qa = bool(self.streaming_model.state.get("shuffle_qa", True))
+
+                qa_list = qa_list = [{"question": q["question"], "answer": q["answer"]} for q in qa_all]
+
                 pr = float(self.model.vqj.score(vid_cpu, qa_list).get("pass_rate", 0.0))
                 pass_rates.append(pr)
 
@@ -1808,6 +1847,8 @@ class Trainer:
                 x = random.gauss(0.5, 0.15)
                 # 超出 [0,1] 直接切掉
                 x = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+                print(qa_list)
+                raise NotImplementedError("Please replace DummyJudge with your actual Video-QA judge implementation.")
                 return {"pass_rate": x, "items": []}
                 # return {"pass_rate": 0.5, "items": []}
 

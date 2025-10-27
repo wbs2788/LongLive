@@ -31,6 +31,7 @@ beta1_critic: 0.0
 beta2_critic: 0.999
 data_path: prompts/vidprom_filtered_extended_5K.txt
 switch_prompt_path: prompts/vidprom_filtered_extended_switch_5K.txt
+jsonl_data_path: prompts/dataset_000.jsonl
 batch_size: 1
 gradient_accumulation_steps: 1
 ema_weight: 0.99
