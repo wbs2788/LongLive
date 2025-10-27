@@ -1254,6 +1254,13 @@ class Trainer:
         if not self.streaming_active:
             self.start_new_sequence()
 
+        if not self.streaming_model.can_generate_more():
+            # Current sequence is finished; start a new one
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[SeqTrain-Trainer] Current sequence completed, starting new one")
+            self.streaming_active = False
+            self.start_new_sequence()
+            
         G = getattr(self.config.grpo, "group_size", 4)
         beta = getattr(self.config.grpo, "beta", 6.0)
         alpha = getattr(self.config.grpo, "alpha", 0.5)
@@ -1784,7 +1791,12 @@ class Trainer:
                 # video_rgb: [T, 3, H, W] in [0,1]
                 # Return 0.0~1.0 pass-rate
                 # >>> Replace with your Qwen-VL based scorer
-                return {"pass_rate": 0.5, "items": []}
+                import random
+                x = random.gauss(0.5, 0.15)
+                # 超出 [0,1] 直接切掉
+                x = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+                return {"pass_rate": x, "items": []}
+                # return {"pass_rate": 0.5, "items": []}
 
         # Option B: load QA index for each prompt (if你要用静态 QA）
         self.qa_index = {}
