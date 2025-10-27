@@ -1266,7 +1266,19 @@ class Trainer:
         alpha = getattr(self.config.grpo, "alpha", 0.5)
         clip_c = getattr(self.config.grpo, "clip_c", 0.25)
         use_ema_baseline = getattr(self.config.grpo, "use_ema_baseline", False)
-        judge_stride = self.config.grpo.get("judge_frame_stride", 2)
+        judge_stride = getattr(self.config.grpo, "judge_frame_stride", 2)
+
+        assert G >= 2, "GRPO group_size must be at least 2"
+        # Use wandb to log these hyperparameters
+        if self.is_main_process and not self.disable_wandb:
+            wandb.log({
+                "grpo_group_size": G,
+                "grpo_beta": beta,
+                "grpo_alpha": alpha,
+                "grpo_clip_c": clip_c,
+                "grpo_use_ema_baseline": use_ema_baseline,
+                "grpo_judge_frame_stride": judge_stride,
+            }, step=self.step)
 
         snap0 = self.streaming_model.get_snapshot()
 
@@ -1302,6 +1314,7 @@ class Trainer:
         if clip_c and clip_c > 0:
             adv = torch.clamp(adv, -clip_c, clip_c)
         weights = torch.sigmoid(beta * adv) * (1.0 - alpha) + alpha
+        weights = weights / weights.mean().detach()     # normalize to mean=1
 
         total_loss_detached = 0.0
         w_list = []
