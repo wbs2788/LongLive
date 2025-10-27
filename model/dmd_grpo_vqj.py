@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 import torch
 import torch.nn.functional as F
-
+from model.vqj import VideoQAJudge
 from model.dmd import DMD
 
 
@@ -58,23 +58,6 @@ def _map_adv_to_weight(
     """
     adv = torch.clamp(adv, -clip_c, clip_c)
     return alpha + torch.sigmoid(beta * adv)
-
-
-# =========================
-# Video-QA Judge (VQJ) interface
-# =========================
-# Implement .score(video_rgb[T, 3, H, W], qa_list) -> {"pass_rate": float, "items": ...}
-# You can wrap your Qwen-VL inference here.
-
-class VideoQAJudge:
-    def score(self, video_rgb: torch.Tensor, qa_list: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Abstract interface. Implement this to:
-          - read video_rgb in [0,1], shape [T, 3, H, W]
-          - run your VLM-judge on qa_list
-          - return {"pass_rate": float, "items": [...]}
-        """
-        raise NotImplementedError
 
 
 # =========================

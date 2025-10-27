@@ -37,3 +37,4 @@ flask
 flask-socketio
 torchao
 peft
+bitsandbytes

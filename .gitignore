@@ -10,4 +10,4 @@ prompts
 vis
 wandb
 .vscode
-vqj_test_logs
+vqj_*

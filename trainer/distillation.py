@@ -16,7 +16,8 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import DMD, DMDSwitch, DMDGRPOVQJ
 from model.streaming_training import StreamingTrainingModel
-from model.dmd_grpo_vqj import GRPOConfig, VideoQAJudge
+from model.dmd_grpo_vqj import GRPOConfig
+from model.vqj import VideoQAJudge, QwenVLJudge
 
 import torch
 import wandb
@@ -1425,8 +1426,7 @@ class Trainer:
                         
                         # Train generator (if needed)
                         if TRAIN_GENERATOR:
-                            use_grpo_now = getattr(self.config, "use_grpo", False) and \
-                                        (self.step % getattr(self.config.grpo, "every_n_steps", 4) == 0)
+                            use_grpo_now = getattr(self.config, "use_grpo", False)
 
                             if use_grpo_now:
                                 if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -1852,16 +1852,21 @@ class Trainer:
                 return {"pass_rate": x, "items": []}
                 # return {"pass_rate": 0.5, "items": []}
 
-        # Option B: load QA index for each prompt (if你要用静态 QA）
-        self.qa_index = {}
-        qa_path = getattr(config.grpo, "qa_index_jsonl", None)
-        if qa_path and os.path.exists(qa_path):
-            # Build prompt->QA list mapping if你把 prompt 文本也存进 JSONL
-            # 或 video_id->QA，再把 dataset 的 prompt 对应到同一 id
-            # 这里留空，由你根据数据写映射
-            pass
+        # Option B: load QA index for each prompt
+        model_path = getattr(config.grpo.judge, "model_path", None) if hasattr(config, "grpo") and hasattr(config.grpo, "judge") else None
+        assert model_path and os.path.exists(model_path), \
+            "Please set a valid config.grpo.judge.model_path to the Qwen-VL (or compatible) model."
 
-        return DummyJudge()
+        max_frames = getattr(config.grpo.judge, "max_frames", 8)
+        max_new_toks = getattr(config.grpo.judge, "max_new_tokens", 32)
+        torch_dtype = getattr(config.grpo.judge, "torch_dtype", "bfloat16")
+        
+        return QwenVLJudge(
+            model_path=model_path,
+            torch_dtype=torch_dtype,
+            max_frames=max_frames,
+            max_new_tokens=max_new_toks,
+        ) if model_path else DummyJudge()
 
     def _set_all_seeds(self, seed: int):
         import numpy as np, random, torch

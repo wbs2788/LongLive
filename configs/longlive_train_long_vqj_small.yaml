@@ -116,3 +116,5 @@ grpo:
   judge_backend: "dummy"  
   qa_index_jsonl: "/path/to/qa_all.jsonl"  
   fps: 16
+  judge:
+    model_path: "../Qwen3-VL-8B-Instruct"
