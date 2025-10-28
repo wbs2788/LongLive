@@ -118,3 +118,11 @@ grpo:
   fps: 16
   judge:
     model_path: "../Qwen3-VL-8B-Instruct"
+    
+monitor:
+  enable: true
+  every_n_steps: 1           # 每多少个 step 记录一次
+  save_dir: "${logdir}/monitor"
+  max_frames_to_log: 16
+  log_to_wandb: true
+  log_video: true             # 也上传一段短视频（可关）

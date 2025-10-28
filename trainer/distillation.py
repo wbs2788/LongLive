@@ -5,6 +5,9 @@ import logging
 import random
 import re
 from pathlib import Path
+import json
+from PIL import Image
+
 
 from utils.dataset import TextDataset, TwoTextDataset, cycle, TwoTextQADataset
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
@@ -28,6 +31,8 @@ from torch.distributed.fsdp import (
     StateDictType, FullStateDictConfig, FullOptimStateDictConfig
 )
 from torchvision.io import write_video
+import numpy as np
+import torchvision.utils as vutils
 
 # LoRA related imports
 import peft
@@ -627,6 +632,16 @@ class Trainer:
         if self.one_logger is not None:
             self.one_logger.on_train_start(train_iterations_start = self.step, train_samples_start = self.step * self.config.batch_size)
         
+        # Monitoring configuration
+        self.monitor_cfg = getattr(config, "monitor", None) or {}
+        self.monitor_enable = bool(self.monitor_cfg.get("enable", False))
+        self.monitor_every = int(self.monitor_cfg.get("every_n_steps", 50))
+        self.monitor_dir = self.monitor_cfg.get("save_dir", os.path.join(config.logdir, "monitor"))
+        self.monitor_max_frames = int(self.monitor_cfg.get("max_frames_to_log", 8))
+        self.monitor_to_wandb = bool(self.monitor_cfg.get("log_to_wandb", True))
+        self.monitor_log_video = bool(self.monitor_cfg.get("log_video", True))
+        os.makedirs(self.monitor_dir, exist_ok=True)
+
     def _move_optimizer_to_device(self, optimizer, device):
         """Move optimizer state to the specified device."""
         for state in optimizer.state.values():
@@ -1336,8 +1351,24 @@ class Trainer:
 
                 qa_list = qa_list = [{"question": q["question"], "answer": q["answer"]} for q in qa_all]
 
-                pr = float(self.model.vqj.score(vid_cpu, qa_list).get("pass_rate", 0.0))
+                res = self.model.vqj.score(vid_cpu, qa_list)
+                pr = float(res.get("pass_rate", 0.0))
                 pass_rates.append(pr)
+
+
+                # —— 定期监控：只在 rank0 且满足步频时记录一次（g==0 避免重复）——
+                if self.monitor_enable and self.is_main_process and (self.step % self.monitor_every == 0) and g == 0:
+                    try:
+                        self._monitor_dump(
+                            step=self.step,
+                            tag="grpo_chunk",
+                            vid_tensor=vid_cpu,          
+                            qa_list=qa_list,            
+                            judge_items=res.get("items"),
+                            pass_rate=pr
+                        )
+                    except Exception as e:
+                        print(f"[Monitor] dump failed at step {self.step}: {e}")
 
         R = torch.tensor(pass_rates, device=self.device, dtype=torch.float32)
         if use_ema_baseline:
@@ -1891,3 +1922,95 @@ class Trainer:
 
     def _prefix_keys(self, d, prefix):
         return {f"{prefix}{k}": v for k, v in d.items()}
+    
+    ## Monitor dump helpers
+    def _tensor_to_pil_list(self, x, max_n=None, resize=None):
+        """
+        x: [T,3,H,W] in [0,1] or [T,H,W,3] uint8/cpu
+        return: List[PIL.Image]
+        """
+        if x is None:
+            return []
+        if torch.is_tensor(x):
+            t = x.detach().cpu()
+            if t.dim() == 4 and t.shape[1] == 3:        # [T,3,H,W] float
+                t = t.clamp(0,1)
+                t = (t * 255.0).byte().permute(0,2,3,1) # [T,H,W,3]
+            elif t.dim() == 4 and t.shape[-1] == 3:     # [T,H,W,3]
+                t = t.byte()
+            else:
+                return []
+            arr = t.numpy()
+        else:
+            arr = np.asarray(x)  # assume [T,H,W,3]
+        T = arr.shape[0]
+        idxs = np.linspace(0, T-1, num=min(T, max_n or T)).round().astype(int)
+        imgs = []
+        for i in idxs:
+            pil = Image.fromarray(arr[i])
+            if resize is not None:
+                pil = pil.resize(resize, Image.BILINEAR)
+            imgs.append(pil)
+        return imgs
+
+    def _save_grid(self, pil_list, out_path, nrow=4):
+        if not pil_list:
+            return
+        tensors = [torch.from_numpy(np.array(im)).permute(2,0,1) for im in pil_list]  # [3,H,W] uint8
+        grid = vutils.make_grid(torch.stack(tensors), nrow=nrow)  # [3,Hg,Wg]
+        grid = grid.permute(1,2,0).numpy().astype(np.uint8)       # [Hg,Wg,3]
+        Image.fromarray(grid).save(out_path)
+
+    def _monitor_dump(self, *, step:int, tag:str, vid_tensor, qa_list, judge_items=None, pass_rate=None):
+        """
+        把帧、QA、判题结果落盘并可选上传到 W&B。
+        - vid_tensor: [T,3,H,W] in [0,1] 或 [T,H,W,3] uint8
+        - qa_list: List[{"question","answer"}]
+        - judge_items: 可传 self.model.vqj 返回的 items（含 predicted_raw/match）
+        """
+        if not self.monitor_enable or (not self.is_main_process):
+            return
+
+        step_dir = Path(self.monitor_dir) / f"step_{step:07d}_{tag}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1) 帧到 PNG（单帧 & grid）
+        frames = self._tensor_to_pil_list(vid_tensor, max_n=self.monitor_max_frames)
+        for i, im in enumerate(frames):
+            im.save(step_dir / f"frame_{i:02d}.png")
+        self._save_grid(frames, step_dir / "frames_grid.png", nrow=4)
+
+        # 2) QA & 判题结果到 JSONL
+        with open(step_dir / "qa.jsonl", "w", encoding="utf-8") as f:
+            for qa in (qa_list or []):
+                f.write(json.dumps(qa, ensure_ascii=False) + "\n")
+        if judge_items is not None or pass_rate is not None:
+            payload = {
+                "pass_rate": float(pass_rate) if pass_rate is not None else None,
+                "items": judge_items or []
+            }
+            with open(step_dir / "judge_outputs.json", "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        # 3) 可选：上传到 W&B
+        if (not self.disable_wandb) and self.monitor_to_wandb:
+            logs = {}
+            try:
+                import wandb
+                logs[f"monitor/{tag}_grid"] = wandb.Image(str(step_dir / "frames_grid.png"))
+                if self.monitor_log_video:
+                    # 构造短视频：[T,H,W,3] uint8
+                    if torch.is_tensor(vid_tensor):
+                        if vid_tensor.dim()==4 and vid_tensor.shape[1]==3:
+                            arr = (vid_tensor.detach().cpu().clamp(0,1)*255).byte().permute(0,2,3,1).numpy()
+                        else:
+                            arr = vid_tensor.detach().cpu().numpy()
+                    else:
+                        arr = np.asarray(vid_tensor)
+                    logs[f"monitor/{tag}_video"] = wandb.Video(arr, fps=8, format="mp4")
+                logs[f"monitor/{tag}_num_qa"] = len(qa_list or [])
+                if pass_rate is not None:
+                    logs[f"monitor/{tag}_pass_rate"] = float(pass_rate)
+                wandb.log(logs, step=step)
+            except Exception as e:
+                print(f"[Monitor] wandb log failed: {e}")
