@@ -1331,7 +1331,7 @@ class Trainer:
 
         snap0 = self.streaming_model.get_snapshot()
 
-        seeds, pass_rates = [], []
+        seeds, final_scores = [], []
         for g in range(G):
             self.streaming_model.load_snapshot(snap0)
 
@@ -1352,8 +1352,8 @@ class Trainer:
                 qa_list = qa_list = [{"question": q["question"], "answer": q["answer"]} for q in qa_all]
 
                 res = self.model.vqj.score(vid_cpu, qa_list)
-                pr = float(res.get("pass_rate", 0.0))
-                pass_rates.append(pr)
+                fs = float(res.get("final_score", 0.0))
+                final_scores.append(fs)
 
 
                 # —— 定期监控：只在 rank0 且满足步频时记录一次（g==0 避免重复）——
@@ -1365,12 +1365,12 @@ class Trainer:
                             vid_tensor=vid_cpu,          
                             qa_list=qa_list,            
                             judge_items=res.get("items"),
-                            pass_rate=pr
+                            pass_rate=fs
                         )
                     except Exception as e:
                         print(f"[Monitor] dump failed at step {self.step}: {e}")
 
-        R = torch.tensor(pass_rates, device=self.device, dtype=torch.float32)
+        R = torch.tensor(final_scores, device=self.device, dtype=torch.float32)
         if use_ema_baseline:
             if not hasattr(self, "_ema_baseline"):
                 self._ema_baseline = {}
@@ -1413,8 +1413,8 @@ class Trainer:
         log = {
             "generator_loss": torch.tensor(total_loss_detached, device=self.device),
             "generator_grad_norm": torch.tensor(0.0, device=self.device),
-            "grpo_pass_rate_mean": R.mean().item(),
-            "grpo_pass_rate_std": (R.std(unbiased=False).item() if G > 1 else 0.0),
+            "grpo_final_scores_mean": R.mean().item(),
+            "grpo_final_scores_std": (R.std(unbiased=False).item() if G > 1 else 0.0),
             "grpo_weight_mean": torch.stack(w_list).mean().item(),
             "grpo_weight_min": torch.stack(w_list).min().item(),
             "grpo_weight_max": torch.stack(w_list).max().item(),
@@ -1631,9 +1631,12 @@ class Trainer:
 
                                 # 列表 -> 直方图（需要 wandb 已 import）
                                 prs = generator_log_dict.get("grpo_pass_rates", None)
+                                fss = generator_log_dict.get("grpo_final_scores", None)
                                 wts = generator_log_dict.get("grpo_weights", None)
                                 if prs:
                                     wandb_loss_dict["grpo/pass_rates_hist"] = wandb.Histogram(prs)
+                                if fss:
+                                    wandb_loss_dict["grpo/final_scores_hist"] = wandb.Histogram(fss)
                                 if wts:
                                     wandb_loss_dict["grpo/weights_hist"] = wandb.Histogram(wts)
 

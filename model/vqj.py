@@ -20,18 +20,24 @@ class VideoQAJudge:
           - return {"pass_rate": float, "items": [...]}
         """
         raise NotImplementedError
+    
+class JudgeConfig:
+    model_path: str = ""
+    torch_dtype: str = "bfloat16"
+    max_frames: int = 8
+    max_new_tokens: int = 32
+    yes_patterns: List[str] = None
+    no_patterns: List[str] = None
+    quantize: str = "4bit"            # "4bit" | "8bit" | "none"
+    vision_resize: Tuple[int,int] = (448, 448)  # 下采样到这个分辨率（长边）
+    max_memory_cuda_gb: Optional[int] = None    # 例如 20 表示 20GiB
+    offload_folder: Optional[str] = None        # CPU卸
+
+
 class QwenVLJudge(VideoQAJudge):
-    def __init__(self, model_path: str,
-                    torch_dtype: str = "bfloat16",
-                    max_frames: int = 8,
-                    max_new_tokens: int = 32,
-                    yes_patterns: List[str] = None,
-                    no_patterns: List[str] = None,
-                    quantize: str = "4bit",            # "4bit" | "8bit" | "none"
-                    vision_resize: Tuple[int,int] = (448, 448),  # 下采样到这个分辨率（长边）
-                    max_memory_cuda_gb: Optional[int] = None,    # 例如 20 表示 20GiB
-                    offload_folder: Optional[str] = None,        # CPU卸载缓存目录
-                    ):
+    def __init__(self, cfg: JudgeConfig):
+        assert cfg.model_path and os.path.exists(cfg.model_path), f"Model path not found: {cfg.model_path}"
+
         self.model_path = model_path
         self.max_frames = int(max_frames)
         self.max_new_tokens = int(max_new_tokens)
@@ -84,83 +90,153 @@ class QwenVLJudge(VideoQAJudge):
             pad_token_id=getattr(self.model.generation_config, "pad_token_id", None)
         )
 
+    def _ask_consistency(self, frames, question_text: str) -> int:
+        """对整段视频问一次一致性，是则 1，否则 0；解析同样走 yes/no 规则。"""
+        messages = [{
+            "role": "user",
+            "content": [
+                *({"type": "image", "image": img} for img in frames),
+                {"type": "text",
+                "text": question_text}
+            ],
+        }]
+        try:
+            pred = self._generate_text(messages, force_short=True)
+        except Exception:
+            return 0
+        label = self._to_label(self._norm(pred))
+        return 1 if label == "yes" else 0
+
     @torch.no_grad()
     def score(self, video_rgb: torch.Tensor, qa_list: List[Dict[str, Any]]):
-        
-        if qa_list is None:
-            print("[VQJ][WARN] qa_list is None")
-            return {"pass_rate": 0.0, "items": []}
-        if len(qa_list) == 0:
-            print("[VQJ][WARN] qa_list is EMPTY")
-            return {"pass_rate": 0.0, "items": []}
+        """
+        增强版评分：
+        - 少于 min_correct 则直接置 0
+        - 追加一致性(binary)问题；默认硬门控：不一致 => 最终 0
+        返回：
+        {
+            "pass_rate": base_pass_rate,         # 原始题目通过率
+            "num_correct": int,
+            "num_total": int,
+            "consistency": int,                  # 1/0
+            "final_score": float,                # 结合一致性的最终得分
+            "items": [...],                      # 每题细项
+        }
+        """
+        # -------- 参数（可放到 config 里）--------
+        min_correct = getattr(self, "min_correct", 5)  # 小于该正确数→置 0
+        # 一致性问题文案：你也可以放到 config.grpo.judge.consistency_question
+        consistency_question = getattr(
+            self, "consistency_question",
+            "Considering the entire clip, is the *main subject* consistent across frames? "
+            "Answer strictly 'YES' or 'NO'."
+        )
+        # 一致性整合策略：硬门控 or 软权重
+        use_hard_gate = getattr(self, "consis_hard_gate", True)
+        # 软权重时：不一致也给一个低权重 alpha（比如 0.2）
+        inconsistency_alpha = float(getattr(self, "consis_alpha_if_no", 0.0))
+        # 强调全对时的一个可选加分（比如全对就再+5%）
+        all_correct_bonus = float(getattr(self, "all_correct_bonus", 0.0))  # 0.0 表示不开
 
-        frames = self._sample_frames_from_tensor(video_rgb, self.max_frames, self.vision_resize)
-        # print(f"[VQJ] qa_count={len(qa_list)}, sampled_frames={len(frames)}")
-        if not frames:
-            print("[VQJ][WARN] No frames sampled from video_rgb (T may be 0, or video_rgb shape not [T,3,H,W])")
-            items = [{"question": qa.get("question",""), "expected": qa.get("answer",""), "predicted": "", "match": 0} for qa in qa_list]
-            return {"pass_rate": 0.0, "items": items}
+        # -------- 输入检查与取帧 --------
         if not qa_list:
+            print("[VQJ][WARN] qa_list is empty")
             return {"pass_rate": 0.0, "items": []}
 
-        # 预采样帧并下采样尺寸
         frames = self._sample_frames_from_tensor(video_rgb, self.max_frames, self.vision_resize)
         if not frames:
-            items = [{"question": qa["question"], "expected": qa.get("answer", ""), "predicted": "", "match": 0} for qa in qa_list]
+            print("[VQJ][WARN] No frames sampled from video_rgb")
+            items = [{"question": qa.get("question",""), "expected": qa.get("answer",""), "predicted": "", "match": 0}
+                    for qa in qa_list]
             return {"pass_rate": 0.0, "items": items}
 
+        # -------- 逐题判分 --------
         items = []
-        # 逐条问答（最省显存；如果合并成一次 batch 会更快但会吃更多显存）
         for qa in qa_list:
             q = str(qa.get("question", ""))
-            expected = str(qa.get("answer", "")).strip().lower()
+            expected_raw = qa.get("answer", "")
 
             messages = [{
                 "role": "user",
-                "content": [*([{"type": "image", "image": img} for img in frames]),
-                            {"type": "text",
-                             "text": ("Answer strictly 'YES' or 'NO' based only on the images. "
-                                      "Do not guess beyond what is visible.\n"
-                                      f"Question: {q}")}],
+                "content": [
+                    *({"type": "image", "image": img} for img in frames),
+                    {"type": "text",
+                    "text": ("Answer strictly 'YES' or 'NO' based only on the images. "
+                            "Do not guess beyond what is visible.\n"
+                            f"Question: {q}")}
+                ],
             }]
 
             try:
                 pred_text = self._generate_text(messages)
             except RuntimeError as e:
-                # OOM 兜底：清缓存、减帧、缩短输出后重试一次
                 if "out of memory" in str(e).lower():
                     self._oom_recover()
-                    fallback_frames = frames[::2] if len(frames) > 2 else frames[:1]
-                    messages[0]["content"] = [*([{"type": "image", "image": img} for img in fallback_frames]),
-                                              {"type":"text","text":messages[0]["content"][-1]["text"]}]
+                    fallback = frames[::2] if len(frames) > 2 else frames[:1]
+                    messages = [{
+                        "role": "user",
+                        "content": [
+                            *({"type": "image", "image": img} for img in fallback),
+                            {"type": "text",
+                            "text": ("Answer strictly 'YES' or 'NO' based only on the images.\n"
+                                    f"Question: {q}")}
+                        ],
+                    }]
                     pred_text = self._generate_text(messages, force_short=True)
                 else:
                     raise
 
-            pred_norm = self._norm(pred_text)
-            pred_label = self._to_label(pred_norm)
+            pred_norm  = self._norm(pred_text)
+            pred_label = self._to_label(pred_norm)   # 'yes'/'no'/'other'
 
-            # expected 可能是 str 或 List[str]
-            expected_raw = qa.get("answer", "")
-            exp_list_norm = self._normalize_expected(expected_raw)
-            exp_labels = { self._to_label(x) for x in exp_list_norm }
+            exp_list_norm = self._normalize_expected(expected_raw)  # List[str]
+            exp_labels    = { self._to_label(x) for x in exp_list_norm }
 
-            # 1) 首选 YES/NO 分类严格匹配
-            if pred_label in ("yes", "no") and ("yes" in exp_labels or "no" in exp_labels):
-                match = int(pred_label in exp_labels)
+            # 先按 YES/NO 分类匹配，若期望非二分类再退化到包含/相等
+            if ("yes" in exp_labels) or ("no" in exp_labels):
+                match = 1 if pred_label in exp_labels else 0
             else:
-                # 2) 兜底：做文本包含/相等匹配（适合非二分类答案，如颜色/物体名）
-                match = int(any(x == pred_norm or x in pred_norm for x in exp_list_norm))
+                match = 1 if any((x == pred_norm) or (x in pred_norm) for x in exp_list_norm) else 0
 
             items.append({
                 "question": q,
-                "expected": expected,
+                "expected": exp_list_norm,    # 存列表，避免类型坑
                 "predicted": pred_text,
-                "match": match,
+                "pred_label": pred_label,
+                "match": int(match),
             })
 
-        pass_rate = sum(it["match"] for it in items) / max(1, len(items))
-        return {"pass_rate": float(pass_rate), "items": items}
+        num_correct = sum(it["match"] for it in items)
+        num_total   = len(items)
+        base_pass_rate = (num_correct / num_total) if num_total > 0 else 0.0
+
+        # -------- 阈值：少于 K 个正确 → 直接置 0 --------
+        if num_correct < min_correct:
+            base_pass_rate = 0.0
+
+        # -------- 一致性问题（再问一次）---------
+        consis = self._ask_consistency(frames, consistency_question)  # 1/0
+
+        # -------- 全正确加成（可选）---------
+        if all_correct_bonus > 0.0 and num_correct == num_total and num_total > 0:
+            base_pass_rate = min(1.0, base_pass_rate * (1.0 + all_correct_bonus))
+
+        # -------- 最终得分融合 --------
+        if use_hard_gate:
+            final_score = base_pass_rate * (1.0 if consis == 1 else 0.0)
+        else:
+            # 软融合：不一致时给一个很低的权重 alpha（如 0.2）
+            c_weight = 1.0 if consis == 1 else float(inconsistency_alpha)
+            final_score = base_pass_rate * c_weight
+
+        return {
+            "pass_rate": float(base_pass_rate),
+            "num_correct": int(num_correct),
+            "num_total": int(num_total),
+            "consistency": int(consis),
+            "final_score": float(final_score),
+            "items": items,
+        }
 
     def _generate_text(self, messages, force_short: bool = False) -> str:
         # 编码
@@ -240,3 +316,4 @@ class QwenVLJudge(VideoQAJudge):
         else:
             lst = [ans]
         return [self._norm(str(x)) for x in lst if x is not None]
+    
