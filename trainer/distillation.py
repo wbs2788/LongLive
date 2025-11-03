@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 import json
 from PIL import Image
-
+from typing import List, Dict, Any, Tuple, Optional, Union
 
 from utils.dataset import TextDataset, TwoTextDataset, cycle, TwoTextQADataset
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
@@ -20,7 +20,7 @@ from omegaconf import OmegaConf
 from model import DMD, DMDSwitch, DMDGRPOVQJ
 from model.streaming_training import StreamingTrainingModel
 from model.dmd_grpo_vqj import GRPOConfig
-from model.vqj import VideoQAJudge, QwenVLJudge
+from model.vqj import VideoQAJudge, QwenVLJudge, JudgeConfig, QwenVLVLLMJudge
 
 import torch
 import wandb
@@ -1729,9 +1729,9 @@ class Trainer:
         
         if self.is_main_process:
             print(f"LoRA target modules for {model_name}: {len(target_linear_modules)} Linear layers")
-            if getattr(self.lora_config, 'verbose', False):
-                for module_name in sorted(target_linear_modules):
-                    print(f"  - {module_name}")
+            # if getattr(self.lora_config, 'verbose', False):
+            #     for module_name in sorted(target_linear_modules):
+            #         print(f"  - {module_name}")
         
         # Create LoRA config
         adapter_type = self.lora_config.get('type', 'lora')
@@ -1871,36 +1871,13 @@ class Trainer:
 
     def _build_vqj(self, config):
         """Factory for Video-QA Judge. Replace DummyJudge with your Qwen-VL judge."""
-        # Option A: dummy judge to verify wiring
-        class DummyJudge(VideoQAJudge):
-            def score(self, video_rgb: torch.Tensor, qa_list):
-                # video_rgb: [T, 3, H, W] in [0,1]
-                # Return 0.0~1.0 pass-rate
-                # >>> Replace with your Qwen-VL based scorer
-                import random
-                x = random.gauss(0.5, 0.15)
-                # 超出 [0,1] 直接切掉
-                x = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
-                print(qa_list)
-                raise NotImplementedError("Please replace DummyJudge with your actual Video-QA judge implementation.")
-                return {"pass_rate": x, "items": []}
-                # return {"pass_rate": 0.5, "items": []}
-
-        # Option B: load QA index for each prompt
-        model_path = getattr(config.grpo.judge, "model_path", None) if hasattr(config, "grpo") and hasattr(config.grpo, "judge") else None
-        assert model_path and os.path.exists(model_path), \
-            "Please set a valid config.grpo.judge.model_path to the Qwen-VL (or compatible) model."
-
-        max_frames = getattr(config.grpo.judge, "max_frames", 8)
-        max_new_toks = getattr(config.grpo.judge, "max_new_tokens", 32)
-        torch_dtype = getattr(config.grpo.judge, "torch_dtype", "bfloat16")
-        
-        return QwenVLJudge(
-            model_path=model_path,
-            torch_dtype=torch_dtype,
-            max_frames=max_frames,
-            max_new_tokens=max_new_toks,
-        ) if model_path else DummyJudge()
+        jc = JudgeConfig.from_config(config)
+        if not jc.model_path:
+            class DummyJudge(VideoQAJudge):
+                def score(self, video_rgb: torch.Tensor, qa_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+                    return {"pass_rate": 0.5, "items": []}
+            return DummyJudge()
+        return QwenVLVLLMJudge(jc)
 
     def _set_all_seeds(self, seed: int):
         import numpy as np, random, torch

@@ -113,10 +113,14 @@ grpo:
   clip_c: 0.25            
   use_ema_baseline: false
   every_n_steps: 1        
+  judge_backend: "dummy"  
+  qa_index_jsonl: "/path/to/qa_all.jsonl"  
+  fps: 16
   judge:
     model_path: "../Qwen3-VL-8B-Instruct"
     quantize: "none"
     max_frames: 16
+    scoring_mode: "consistency_only"
     
 monitor:
   enable: true

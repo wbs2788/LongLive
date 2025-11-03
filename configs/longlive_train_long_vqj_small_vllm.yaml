@@ -113,10 +113,25 @@ grpo:
   clip_c: 0.25            
   use_ema_baseline: false
   every_n_steps: 1        
+  judge_backend: "dummy"  
+  qa_index_jsonl: "/path/to/qa_all.jsonl"  
+  fps: 16
   judge:
-    model_path: "../Qwen3-VL-8B-Instruct"
+    model_path: "qwen-judge"
     quantize: "none"
-    max_frames: 16
+    max_frames: 12
+    scoring_mode: "full"
+    max_new_tokens: 4
+    vllm:
+      tensor_parallel_size: 8
+      enable_expert_parallel: true
+      kv_cache_dtype: "fp8"            # H20 (Hopper) 支持 FP8 KV
+      max_model_len: 2048              # 控上下文 → 省KV
+      gpu_memory_utilization: 0.62     # H20 96GB 上空载≈60GB/卡
+      cpu_offload_gb: 8                # 不够再加到 16/24（会更慢）
+      max_num_seqs: 8                  # 控并发 → 省KV
+      max_num_batched_tokens: 1024     # 控每步总token → 省KV
+      enforce_eager: true              # 显存更稳定
     
 monitor:
   enable: true
