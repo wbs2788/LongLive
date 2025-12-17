@@ -1,4 +1,4 @@
-generator_ckpt: logs/checkpoint_model_000700/model.pt
+generator_ckpt: longlive_models/models/longlive_base.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
@@ -33,13 +33,13 @@ data_path: prompts/vidprom_filtered_extended_5K.txt
 switch_prompt_path: prompts/vidprom_filtered_extended_switch_5K.txt
 jsonl_data_path: prompts/dataset_000.jsonl
 batch_size: 1
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 4
 ema_weight: 0.99
 ema_start_step: 200
-total_batch_size: 64
+total_batch_size: 16
 log_iters: 50
 max_checkpoints: 3
-max_iters: 3000
+max_iters: 2300
 
 negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
 dfake_gen_update_ratio: 5
@@ -109,18 +109,23 @@ use_grpo: true
 grpo:
   group_size: 4           
   beta: 6.0               
-  alpha: 0.5              
-  clip_c: 0.25            
+  alpha: 0.1              
+  clip_c: 1.0           
   use_ema_baseline: false
   every_n_steps: 1        
   judge_backend: "dummy"  
-  qa_index_jsonl: "/path/to/qa_all.jsonl"  
   fps: 16
+  norm_adv: true
+  min_std_for_update: 0.01
+  self.config.grpo.clip_low: 0.25                 # 负向 advantage clip 下界（|负梯度| 不要太大）
+  self.config.grpo.clip_high: 1.0                 # 正向 advantage clip 上界（正梯度可以更大）
+  lambda_teacher: 1.0
   judge:
-    model_path: "qwen-judge"
+    model_path: "../Qwen3-VL-8B-Instruct"
+    backend: "hf"
     quantize: "none"
     max_frames: 12
-    scoring_mode: "full"
+    scoring_mode: "consis_only"
     max_new_tokens: 4
     vllm:
       tensor_parallel_size: 8
@@ -135,7 +140,7 @@ grpo:
     
 monitor:
   enable: true
-  every_n_steps: 1           # 每多少个 step 记录一次
+  every_n_steps: 50           # 每多少个 step 记录一次
   save_dir: "${logdir}/monitor"
   max_frames_to_log: 16
   log_to_wandb: true

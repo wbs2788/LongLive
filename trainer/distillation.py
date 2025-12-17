@@ -1162,6 +1162,8 @@ class Trainer:
         st["qa"] = qa_all if qa_all is not None else []    # List[{"question","answer",...}]
         st["qa_per_chunk"] = getattr(self.config.grpo, "qa_per_chunk", 6)
         st["shuffle_qa"] = getattr(self.config.grpo, "shuffle_qa", True)
+        st["prompt_text"] = text_prompts[0]
+        st["switch_prompt_text"] = batch["switch_prompts"][0] if "switch_prompts" in batch else None
 
         
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -1300,11 +1302,12 @@ class Trainer:
         assert getattr(self.config, "use_grpo", False)
         self.model.eval()
 
+        # 保证有正在进行的序列
         if not self.streaming_active:
             self.start_new_sequence()
 
         if not self.streaming_model.can_generate_more():
-            # Current sequence is finished; start a new one
+            # 当前序列结束，重新开一条
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Trainer] Current sequence completed, starting new one")
             self.streaming_active = False
@@ -1317,8 +1320,14 @@ class Trainer:
         use_ema_baseline = getattr(self.config.grpo, "use_ema_baseline", False)
         judge_stride = getattr(self.config.grpo, "judge_frame_stride", 2)
 
+        norm_adv = getattr(self.config.grpo, "norm_adv", True)
+        clip_low = getattr(self.config.grpo, "clip_low", clip_c)   # 负向 clip
+        clip_high = getattr(self.config.grpo, "clip_high", clip_c) # 正向 clip
+        min_std_for_update = getattr(self.config.grpo, "min_std_for_update", 0.02)
+
         assert G >= 2, "GRPO group_size must be at least 2"
-        # Use wandb to log these hyperparameters
+
+        # log 一下 GRPO 超参
         if self.is_main_process and not self.disable_wandb:
             wandb.log({
                 "grpo_group_size": G,
@@ -1327,70 +1336,169 @@ class Trainer:
                 "grpo_clip_c": clip_c,
                 "grpo_use_ema_baseline": use_ema_baseline,
                 "grpo_judge_frame_stride": judge_stride,
+                "grpo_norm_adv": norm_adv,
+                "grpo_clip_low": clip_low,
+                "grpo_clip_high": clip_high,
+                "grpo_min_std_for_update": min_std_for_update,
             }, step=self.step)
 
+        # ===== 1. 从同一个 pre-chunk 状态分叉出 G 个 candidate，纯 forward + judge =====
         snap0 = self.streaming_model.get_snapshot()
 
-        seeds, final_scores = [], []
+        seeds, final_scores, judge_results = [], [], []
         for g in range(G):
+            # 回到共同起点
             self.streaming_model.load_snapshot(snap0)
 
+            # 固定随机种子，保证 rollout 可重放
             seed = int(torch.randint(0, 2**31 - 1, (1,), device=self.device).item())
             seeds.append(seed)
             self._set_all_seeds(seed)
 
             with torch.no_grad():
+                # 这里不带 grad，只是用来打分
                 chunk, info = self.streaming_model.generate_next_chunk(requires_grad=False)
                 vid_cpu = self.streaming_model.decode_chunk_for_judge(
                     chunk, frame_stride=judge_stride, to_cpu=True
                 )
-
+                
                 qa_all = self.streaming_model.state.get("qa", [])
-                max_qs = int(self.streaming_model.state.get("qa_per_chunk", 6))
-                shuffle_qa = bool(self.streaming_model.state.get("shuffle_qa", True))
-
-                qa_list = qa_list = [{"question": q["question"], "answer": q["answer"]} for q in qa_all]
+                qa_list = [{"question": q["question"], "answer": q["answer"]} for q in qa_all]
 
                 res = self.model.vqj.score(vid_cpu, qa_list)
                 fs = float(res.get("final_score", 0.0))
                 final_scores.append(fs)
+                judge_results.append(res)
 
-
-                # —— 定期监控：只在 rank0 且满足步频时记录一次（g==0 避免重复）——
+                # 监控用
                 if self.monitor_enable and self.is_main_process and (self.step % self.monitor_every == 0) and g == 0:
                     try:
                         self._monitor_dump(
                             step=self.step,
                             tag="grpo_chunk",
-                            vid_tensor=vid_cpu,          
-                            qa_list=qa_list,            
+                            vid_tensor=vid_cpu,
+                            qa_list=qa_list,
                             judge_items=res.get("items"),
                             pass_rate=fs
                         )
                     except Exception as e:
                         print(f"[Monitor] dump failed at step {self.step}: {e}")
 
+        # ===== 2. 根据打分计算 advantage / weights =====
         R = torch.tensor(final_scores, device=self.device, dtype=torch.float32)
+        R_std = R.std(unbiased=False).item()
+        R_mean = R.mean().item()
+
+        # ==============================================================================
+        # [CRITICAL FIX] 民主投票解决死锁 (Voting Mechanism)
+        # ==============================================================================
+        
+        # 1. 本地决定：我这张卡是否满足“低方差”条件？
+        # 如果方差小 (True)，代表我想投赞成票 (1)；否则投反对票 (0)
+        local_vote = (min_std_for_update > 0.0) and (R_std < min_std_for_update)
+        vote_tensor = torch.tensor(1 if local_vote else 0, device=self.device, dtype=torch.int32)
+
+        # 2. 统计票数：将所有卡的票数加起来 (All Reduce Sum)
+        # 结果会同步到每一张卡上，保证大家看到的 total_votes 是完全一样的
+        if dist.is_initialized():
+            dist.all_reduce(vote_tensor, op=dist.ReduceOp.SUM)
+            total_yes_votes = vote_tensor.item()
+        else:
+            total_yes_votes = 1 if local_vote else 0
+
+        # 3. 共同决策：少数服从多数
+        # 如果赞成票超过总卡数的一半，则全体进入“低方差模式”
+        should_enter_low_std_mode = total_yes_votes > (self.world_size / 2)
+
+        # (可选) Debug 打印投票详情
+        if self.is_main_process and DEBUG:
+             print(f"[GRPO Vote] Yes: {total_yes_votes}/{self.world_size} -> Enter Low Std Mode: {should_enter_low_std_mode}")
+        
+        # ==============================================================================
+
+        # ---------- 低方差分支：全员行动一致 ----------
+        if should_enter_low_std_mode:
+            best_idx = int(torch.argmax(R).item())
+
+            # 恢复到 pre-chunk 状态
+            self.streaming_model.load_snapshot(snap0)
+            self._set_all_seeds(seeds[best_idx])
+
+            # 在 snapshot 状态上，基于 best candidate 的 judge 结果，更新 teacher prompt + teacher_cond
+            self._update_teacher_prompts_from_best(best_idx, judge_results, best_info=None)
+
+            # 带梯度重新 rollout 一次 best candidate，这次 compute_generator_loss 内部会看到 teacher_cond
+            chunk, info = self.streaming_model.generate_next_chunk(requires_grad=True)
+            loss_g, _ = self.streaming_model.compute_generator_loss(
+                chunk=chunk,
+                chunk_info=info,
+            )
+            (loss_g / self.gradient_accumulation_steps).backward()
+            total_loss_detached = loss_g.detach().item()
+
+            # critic 那边要用的 best_chunk / best_info（用 detach，避免把 graph 传过去）
+            best_chunk = chunk.detach()
+            best_info = info
+
+            log = {
+                "generator_loss": torch.tensor(total_loss_detached, device=self.device),
+                "generator_grad_norm": torch.tensor(0.0, device=self.device),
+                "grpo_final_scores_mean": R_mean,
+                "grpo_final_scores_std": R_std,
+                "grpo_weight_mean": 1.0,
+                "grpo_weight_min": 1.0,
+                "grpo_weight_max": 1.0,
+                "grpo_best_idx": best_idx,
+                "grpo_best_pr": R[best_idx].item(),
+                "grpo_low_std_fallback": 1,
+                "grpo_final_scores": final_scores,
+            }
+            return log, best_chunk, best_info
+
+        # ---------- 正常 GRPO 分支 ----------
+        # 这里 advantage 用 R 或 R - baseline
         if use_ema_baseline:
             if not hasattr(self, "_ema_baseline"):
                 self._ema_baseline = {}
             prompt_text = getattr(self, "current_prompt_text", None) or \
                         self.streaming_model.state.get("prompt_text", "unknown_prompt")
             key = self._prompt_key(prompt_text)
-            b_prev = self._ema_baseline.get(key, R.mean().item())
+            b_prev = self._ema_baseline.get(key, R_mean)
             adv = R - b_prev
-            self._ema_baseline[key] = 0.9 * b_prev + 0.1 * R.mean().item()
+            self._ema_baseline[key] = 0.9 * b_prev + 0.1 * R_mean
         else:
-            adv = R - R.mean()
-        if clip_c and clip_c > 0:
-            adv = torch.clamp(adv, -clip_c, clip_c)
-        weights = torch.sigmoid(beta * adv) * (1.0 - alpha) + alpha
-        weights = weights / weights.mean().detach()     # normalize to mean=1
+            adv = R - R_mean
 
+        if norm_adv and R_std > 0:
+            adv = adv / (R_std + 1e-8)
+
+        # DAPO 风格非对称 clip
+        if clip_low is not None and clip_high is not None:
+            adv = torch.clamp(adv, -clip_low, clip_high)
+        elif clip_c and clip_c > 0:
+            adv = torch.clamp(adv, -clip_c, clip_c)
+
+        weights = torch.sigmoid(beta * adv) * (1.0 - alpha) + alpha
+        weights = weights / weights.mean().detach()
+
+        best_idx = int(torch.argmax(R).item())
+
+        # 关键：我们希望所有 GRPO rollout 都在“已经写好 teacher prompt”的 pre-chunk 状态上起步
+        # 所以：
+        #   1) 先回到 snap0
+        #   2) 在这个状态上更新 teacher prompt / teacher_cond
+        #   3) 再重新 snapshot 一次，得到 snap_teacher
+        self.streaming_model.load_snapshot(snap0)
+        self._update_teacher_prompts_from_best(best_idx, judge_results, best_info=None)
+        snap_teacher = self.streaming_model.get_snapshot()
+
+        # ===== 3. 在带 teacher_cond 的 snapshot 上，做 GRPO weighted DMD 训练 =====
         total_loss_detached = 0.0
         w_list = []
+
         for g in range(G):
-            self.streaming_model.load_snapshot(snap0)
+            # 每个 candidate 都从 snap_teacher 起步（含 teacher_cond）
+            self.streaming_model.load_snapshot(snap_teacher)
             self._set_all_seeds(seeds[g])
 
             chunk, info = self.streaming_model.generate_next_chunk(requires_grad=True)
@@ -1405,24 +1513,132 @@ class Trainer:
             del chunk, info, loss_g
             torch.cuda.empty_cache()
 
-        best_idx = int(torch.argmax(R).item())
-        self.streaming_model.load_snapshot(snap0)
+        # ===== 4. 为 critic 准备 best rollout（不用 grad） =====
+        self.streaming_model.load_snapshot(snap_teacher)
         self._set_all_seeds(seeds[best_idx])
         best_chunk, best_info = self.streaming_model.generate_next_chunk(requires_grad=False)
 
         log = {
             "generator_loss": torch.tensor(total_loss_detached, device=self.device),
             "generator_grad_norm": torch.tensor(0.0, device=self.device),
-            "grpo_final_scores_mean": R.mean().item(),
+            "grpo_final_scores_mean": R_mean,
             "grpo_final_scores_std": (R.std(unbiased=False).item() if G > 1 else 0.0),
             "grpo_weight_mean": torch.stack(w_list).mean().item(),
             "grpo_weight_min": torch.stack(w_list).min().item(),
             "grpo_weight_max": torch.stack(w_list).max().item(),
             "grpo_best_idx": best_idx,
             "grpo_best_pr": R[best_idx].item(),
+            "grpo_final_scores": final_scores,
+            "grpo_weights": [w.item() for w in w_list],
+            "grpo_low_std_fallback": 0,
         }
         return log, best_chunk.detach(), best_info
 
+    def _update_teacher_prompts_from_best(self, best_idx, judge_results, best_info=None):
+        """
+        基于 best candidate 的 QA 结果，更新 teacher prompt 以及对应的 text encoder 条件。
+        FIXED: Ensures FSDP text_encoder is called on all ranks to prevent deadlock.
+        """
+        # --- 1. 获取状态引用 ---
+        st = self.streaming_model.state
+        cond_info = st.get("conditional_info", {})
+        
+        # Get base prompts
+        base_prompt = st.get("prompt_text", "")
+        base_switch = st.get("switch_prompt_text", None)
+
+        # Default teacher prompts to base prompts (Fallbacks)
+        teacher_prompt = base_prompt
+        teacher_switch_prompt = base_switch
+
+        # --- 2. Determine if we need to rewrite ---
+        should_rewrite = True
+        
+        # Check if judge results exist
+        if not judge_results or best_idx >= len(judge_results):
+            should_rewrite = False
+        else:
+            # Check for wrong items
+            res = judge_results[best_idx] or {}
+            qa_items = res.get("items", [])
+            wrong_items = [it for it in qa_items if not it.get("match")]
+            
+            if not wrong_items:
+                # Perfect score: No rewrite needed, but we MUST NOT return early
+                if self.is_main_process and DEBUG:
+                    print(f"[TeacherPrompt] Step {self.step}: Candidate {best_idx} perfect score. Using original prompt as teacher.")
+                should_rewrite = False
+            
+            if not base_prompt and not base_switch:
+                if self.is_main_process:
+                    print(f"[TeacherPrompt] WARNING: 'prompt_text' missing! Using original embeddings.")
+                should_rewrite = False
+
+        # --- 3. Perform Rewrite (Only if needed) ---
+        if should_rewrite:
+            max_new_tokens = getattr(self.config.grpo, "rewrite_max_new_tokens", 256)
+            try:
+                # 优先用 pair 版本
+                if base_prompt and base_switch and hasattr(self.model.vqj, "rewrite_teacher_prompts_pair"):
+                    new_a, new_b = self.model.vqj.rewrite_teacher_prompts_pair(
+                        prompt_a=base_prompt,
+                        prompt_b=base_switch,
+                        qa_items=wrong_items,
+                        max_new_tokens=max_new_tokens,
+                    )
+                    teacher_prompt = new_a or base_prompt
+                    teacher_switch_prompt = new_b or base_switch
+                else:
+                    # fallback：分别单独改
+                    if base_prompt:
+                        rewritten = self.model.vqj.rewrite_teacher_prompt(
+                            base_prompt=base_prompt,
+                            qa_items=wrong_items,
+                            max_new_tokens=max_new_tokens // 2,
+                        )
+                        teacher_prompt = rewritten or base_prompt
+                    
+                    if base_switch:
+                        rewritten = self.model.vqj.rewrite_teacher_prompt(
+                            base_prompt=base_switch,
+                            qa_items=wrong_items,
+                            max_new_tokens=max_new_tokens // 2,
+                        )
+                        teacher_switch_prompt = rewritten or base_switch
+
+            except Exception as e:
+                if self.is_main_process:
+                    print(f"[TeacherPrompt] rewrite failed: {e}")
+                # Keep defaults (base prompts) on failure
+
+        # --- 4. Encode Teacher Prompts (CRITICAL: MUST RUN ON ALL RANKS) ---
+        # Even if we didn't rewrite, we encode the (potentially original) prompts 
+        # so that FSDP stays synchronized.
+        
+        if teacher_prompt:
+            st["teacher_prompt_text"] = teacher_prompt
+            with torch.no_grad():
+                # [FIX] Always call this collective op
+                teacher_cond = self.model.text_encoder(text_prompts=[teacher_prompt])
+            cond_info["teacher_conditional_dict"] = teacher_cond
+
+        if teacher_switch_prompt and base_switch:
+            st["teacher_switch_prompt_text"] = teacher_switch_prompt
+            with torch.no_grad():
+                # [FIX] Always call this collective op
+                teacher_switch_cond = self.model.text_encoder(text_prompts=[teacher_switch_prompt])
+            cond_info["teacher_switch_conditional_dict"] = teacher_switch_cond
+
+        # 这一步非常重要，确保更新后的字典存回 state
+        st["conditional_info"] = cond_info
+
+        if self.is_main_process and DEBUG and should_rewrite:
+            print("[TeacherPrompt] Updated teacher prompts:")
+            if teacher_prompt != base_prompt:
+                print("  teacher_prompt_text:", teacher_prompt)
+            if teacher_switch_prompt != base_switch:
+                print("  teacher_switch_prompt_text:", teacher_switch_prompt)
+                    
     def train(self):
         start_step = self.step
         try:
@@ -1619,6 +1835,8 @@ class Trainer:
                             wandb_loss_dict.update(self._prefix_keys(generator_log_dict, "gen/"))
                             wandb_loss_dict.update(self._prefix_keys(critic_log_dict, "crit/"))
 
+                            wandb_loss_dict = self._wandb_sanitize_dict(wandb_loss_dict)
+
                             # GRPO 专属：如果存在就额外记录
                             if "grpo_pass_rate_mean" in generator_log_dict:
                                 wandb_loss_dict["grpo/pass_rate_mean"] = generator_log_dict["grpo_pass_rate_mean"]
@@ -1640,6 +1858,7 @@ class Trainer:
                                 if wts:
                                     wandb_loss_dict["grpo/weights_hist"] = wandb.Histogram(wts)
 
+                            
                             if not self.disable_wandb:
                                 wandb.log(wandb_loss_dict, step=self.step)
                     self.previous_time = current_time
@@ -1870,14 +2089,17 @@ class Trainer:
         return hashlib.sha1(text.strip().encode("utf-8")).hexdigest()[:16]
 
     def _build_vqj(self, config):
-        """Factory for Video-QA Judge. Replace DummyJudge with your Qwen-VL judge."""
         jc = JudgeConfig.from_config(config)
         if not jc.model_path:
             class DummyJudge(VideoQAJudge):
-                def score(self, video_rgb: torch.Tensor, qa_list: List[Dict[str, Any]]) -> Dict[str, Any]:
-                    return {"pass_rate": 0.5, "items": []}
+                def score(self, video_rgb, qa_list):
+                    return {"pass_rate": 0.5, "items": [], "final_score": 0.5, "num_correct": 0, "num_total": 0, "consistency": 1, "mode": "full"}
             return DummyJudge()
-        return QwenVLVLLMJudge(jc)
+
+        if (jc.backend or "hf").lower() == "vllm":
+            return QwenVLVLLMJudge(jc)
+        else:
+            return QwenVLJudge(jc)
 
     def _set_all_seeds(self, seed: int):
         import numpy as np, random, torch
@@ -1994,3 +2216,34 @@ class Trainer:
                 wandb.log(logs, step=step)
             except Exception as e:
                 print(f"[Monitor] wandb log failed: {e}")
+
+    def _wandb_sanitize_value(self, v):
+        import numpy as np, random, torch
+        if torch.is_tensor(v):
+            v = v.detach().to(torch.float32, copy=False).cpu()
+            return v.item() if v.numel() == 1 else v.mean().item()
+        if isinstance(v, np.ndarray):
+            v = v.astype(np.float32, copy=False)
+            return float(v.mean()) if v.size > 1 else float(v.item())
+        if isinstance(v, (list, tuple)):
+            out = []
+            for x in v:
+                if torch.is_tensor(x):
+                    out.append(x.detach().to(torch.float32).cpu().item() if x.numel()==1
+                            else float(x.detach().to(torch.float32).mean().cpu().item()))
+                elif isinstance(x, (int, float)):
+                    out.append(float(x))
+                else:
+                    try: out.append(float(x))
+                    except: pass
+            return out
+        try:
+            import numpy as np
+            if isinstance(v, np.generic):
+                return float(v)
+        except: pass
+        return v  
+        
+
+    def _wandb_sanitize_dict(self, d: dict):
+        return {k: self._wandb_sanitize_value(v) for k, v in d.items()}

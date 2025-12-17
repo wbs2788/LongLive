@@ -38,6 +38,7 @@ def _build_max_memory(max_memory_cuda_gb: Optional[int]) -> Optional[Dict[Union[
 class JudgeConfig:
     # 通用
     model_path: str = ""
+    backend: str = "hf"
     torch_dtype: str = "bfloat16"
     max_frames: int = 8
     max_new_tokens: int = 32
@@ -86,6 +87,7 @@ class JudgeConfig:
         src = _get(getattr(cfg, "grpo", None), "judge", None) or cfg
         out = JudgeConfig(
             model_path=_get(src, "model_path", ""),
+            backend=getattr(src, "backend", "hf") if not isinstance(src, dict) else src.get("backend", "hf"),
             torch_dtype=_get(src, "torch_dtype", "bfloat16"),
             max_frames=int(_get(src, "max_frames", 8) or 8),
             max_new_tokens=int(_get(src, "max_new_tokens", 32) or 32),
@@ -324,6 +326,197 @@ class QwenVLJudge(VideoQAJudge):
             "items": items,
         }
 
+    @torch.no_grad()
+    def rewrite_teacher_prompt(
+        self,
+        base_prompt: str,
+        qa_items: List[Dict[str, Any]],
+        max_new_tokens: int = 128,
+    ) -> str:
+        """
+        根据没有 match 的 QA，改写一条更强约束的 prompt，给 teacher 模型用。
+        - base_prompt: 原始的视频生成指令
+        - qa_items: vqj.score(...) 里返回的 items（其中有 question / expected / match）
+        - lang: "zh" 或 "en"，决定提示用中文还是英文描述
+        """
+        # 1) 只取没通过的 QA
+        wrong_items = [it for it in (qa_items or []) if not it.get("match")]
+        if not wrong_items:
+            # 没有错误就直接用原 prompt
+            return base_prompt
+
+        # 2) 把错误 QA 列成文本（问题 + 期望答案）
+        lines = []
+        for i, it in enumerate(wrong_items, 1):
+            q = str(it.get("question", "")).strip()
+            # expected 是归一化后的 list[str]
+            exp_list = it.get("expected") or []
+            if isinstance(exp_list, str):
+                exp_list = [exp_list]
+            exp_str = " / ".join(exp_list) if exp_list else ""
+            line = f"{i}. Q: {q}\n   Expected answer: {exp_str}"
+            lines.append(line)
+        qa_block = "\n".join(lines)
+
+        # 3) 构造让 Qwen 改写的 meta-prompt
+        prompt_text = (
+            "You are a video prompt rewriting assistant.\n\n"
+            "Goal:\n"
+            "Given an original video generation instruction and several visual QA items "
+            "that are currently answered incorrectly, rewrite the instruction so that "
+            "the desired visual conditions become explicit.\n\n"
+            "Requirements:\n"
+            "1. Preserve the main story, characters and setting of the original prompt as much as possible.\n"
+            "2. For each \"Q / Expected\", turn the expected answer into a clear visual condition "
+            "and explicitly incorporate it into the new prompt.\n"
+            "3. Do NOT mention words like 'QA', 'evaluation', 'model', 'score', etc.; "
+            "only describe what should appear in the video.\n"
+            "4. Output only ONE rewritten prompt, without explanations.\n\n"
+            f"Original prompt:\n{base_prompt}\n\n"
+            "These visual QA items were answered incorrectly by the current video:\n"
+            f"{qa_block}\n\n"
+            "Now provide the rewritten prompt:"
+        )
+
+        # 4) 调用 Qwen-VL 做纯文本生成
+        messages = [{
+            "role": "user",
+            "content": [{"type": "text", "text": prompt_text}],
+        }]
+
+        # 这里单独指定 max_new_tokens，避免影响 VQA 生成配置
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+        inputs = {k: (v.to(self.model.device) if hasattr(v, "to") else v)
+                  for k, v in inputs.items()}
+
+        gen_kwargs = dict(self.generation_kwargs)
+        gen_kwargs["max_new_tokens"] = max_new_tokens
+
+        cm = torch.autocast("cuda", dtype=self.model.dtype) if torch.cuda.is_available() else torch.no_grad()
+        with cm:
+            out = self.model.generate(**inputs, **gen_kwargs)
+
+        trimmed = [o[len(i):] for i, o in zip(inputs["input_ids"], out)]
+        new_prompt = self.processor.batch_decode(
+            trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )[0].strip()
+        
+        if not new_prompt:
+            print(f"Warning! Rewrite model is now unreachable.")
+        return new_prompt or base_prompt
+    
+    def rewrite_teacher_prompts_pair(
+        self,
+        prompt_a: str,
+        prompt_b: str,
+        qa_items: List[Dict[str, Any]],
+        max_new_tokens: int = 2048,
+    ) -> Tuple[str, str]:
+
+        wrong_items = [it for it in (qa_items or []) if not it.get("match")]
+        if not wrong_items:
+            return prompt_a, prompt_b
+
+        # 构造 QA 文本块
+        lines = []
+        for i, it in enumerate(wrong_items, 1):
+            q = str(it.get("question", "")).strip()
+            exp_list = it.get("expected") or []
+            if isinstance(exp_list, str):
+                exp_list = [exp_list]
+            exp_str = " / ".join(exp_list)
+            line = f"{i}. Q: {q}\n   Expected answer: {exp_str}"
+            lines.append(line)
+        qa_block = "\n".join(lines)
+
+        prompt_text = (
+            "You are a video prompt rewriting assistant.\n\n"
+            "The video has TWO segments in time order:\n"
+            " - Prompt A describes the EARLY part of the video.\n"
+            " - Prompt B describes the LATER part of the video after a transition.\n\n"
+            "Goal:\n"
+            "Given the original Prompt A and Prompt B, and several visual QA items that "
+            "are currently answered incorrectly, rewrite BOTH prompts so that the desired "
+            "visual conditions become explicit.\n\n"
+            "Requirements:\n"
+            "1. Preserve the main story, characters and setting of both prompts as much as possible.\n"
+            "2. For each \"Q / Expected\", decide whether it refers mainly to the early segment (A), "
+            "the later segment (B), or both. Then inject the expected visual condition into the appropriate prompt.\n"
+            "3. Keep the temporal structure: A happens before B.\n"
+            "4. Do NOT mention words like 'QA', 'evaluation', 'model', 'score'; "
+            "only describe what should appear in the video.\n"
+            "5. Output in the following format ONLY:\n"
+            "   Prompt A: <rewritten prompt A on one line>\n"
+            "   Prompt B: <rewritten prompt B on one line>\n\n"
+            "For EVERY QA item listed below:\n"
+            "- If the expected answer is 'yes':\n"
+            "You MUST ensure that the described event HAPPENS in the video, and you MUST explicitly describe this event in the rewritten prompt.\n"
+            "- If the expected answer is 'no':\n"
+            "You MUST ensure that this event does NOT happen in the video, and you MUST make the absence clear in the prompt if needed.\n"
+            "Do not skip any QA. Every QA must influence the rewritten prompt.\n\n"
+            f"Original Prompt A:\n{prompt_a}\n\n"
+            f"Original Prompt B:\n{prompt_b}\n\n"
+            "These visual QA items were answered incorrectly by the current video:\n"
+            f"{qa_block}\n\n"
+            "Now provide the rewritten prompts:\n"
+            "Prompt A:"
+        )
+
+        messages = [{
+            "role": "user",
+            "content": [{"type": "text", "text": prompt_text}],
+        }]
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+        inputs = {k: (v.to(self.model.device) if hasattr(v, "to") else v)
+                for k, v in inputs.items()}
+
+        gen_kwargs = dict(self.generation_kwargs)
+        gen_kwargs["max_new_tokens"] = max_new_tokens
+
+        cm = torch.autocast("cuda", dtype=self.model.dtype) if torch.cuda.is_available() else torch.no_grad()
+        with cm:
+            out = self.model.generate(**inputs, **gen_kwargs)
+
+        trimmed = [o[len(i):] for i, o in zip(inputs["input_ids"], out)]
+        full_text = self.processor.batch_decode(
+            trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )[0].strip()
+
+        # 简单解析 Prompt A / B
+        new_a, new_b = prompt_a, prompt_b
+        if "Prompt B:" in full_text:
+            parts = full_text.split("Prompt B:", 1)
+            a_part = parts[0].replace("Prompt A:", "").strip()
+            b_part = parts[1].strip()
+            if a_part:
+                new_a = a_part
+            if b_part:
+                new_b = b_part
+        else:
+            # 万一只返回了一段，就默认当 A 用
+            if full_text:
+                new_a = full_text
+
+        return new_a, new_b
+
+
     # ---------- internals ----------
     def _generate(self, messages, force_short: bool = False) -> str:
         inputs = self.processor.apply_chat_template(
@@ -548,6 +741,197 @@ class QwenVLVLLMJudge(VideoQAJudge):
             "final_score": float(final_score),
             "items": items,
         }
+
+            # ---------- rewrite: 根据错误的 QA 改写 teacher prompt ----------
+    @torch.no_grad()
+    def rewrite_teacher_prompt(
+        self,
+        base_prompt: str,
+        qa_items: List[Dict[str, Any]],
+        max_new_tokens: int = 128,
+    ) -> str:
+        """
+        根据没有 match 的 QA，改写一条更强约束的 prompt，给 teacher 模型用。
+        - base_prompt: 原始的视频生成指令
+        - qa_items: vqj.score(...) 里返回的 items（其中有 question / expected / match）
+        - lang: "zh" 或 "en"，决定提示用中文还是英文描述
+        """
+        # 1) 只取没通过的 QA
+        wrong_items = [it for it in (qa_items or []) if not it.get("match")]
+        if not wrong_items:
+            # 没有错误就直接用原 prompt
+            return base_prompt
+
+        # 2) 把错误 QA 列成文本（问题 + 期望答案）
+        lines = []
+        for i, it in enumerate(wrong_items, 1):
+            q = str(it.get("question", "")).strip()
+            # expected 是归一化后的 list[str]
+            exp_list = it.get("expected") or []
+            if isinstance(exp_list, str):
+                exp_list = [exp_list]
+            exp_str = " / ".join(exp_list) if exp_list else ""
+            line = f"{i}. Q: {q}\n   Expected answer: {exp_str}"
+            lines.append(line)
+        qa_block = "\n".join(lines)
+
+        # 3) 构造让 Qwen 改写的 meta-prompt
+        prompt_text = (
+            "You are a video prompt rewriting assistant.\n\n"
+            "Goal:\n"
+            "Given an original video generation instruction and several visual QA items "
+            "that are currently answered incorrectly, rewrite the instruction so that "
+            "the desired visual conditions become explicit.\n\n"
+            "Requirements:\n"
+            "1. Preserve the main story, characters and setting of the original prompt as much as possible.\n"
+            "2. For each \"Q / Expected\", turn the expected answer into a clear visual condition "
+            "and explicitly incorporate it into the new prompt.\n"
+            "3. Do NOT mention words like 'QA', 'evaluation', 'model', 'score', etc.; "
+            "only describe what should appear in the video.\n"
+            "4. Output only ONE rewritten prompt, without explanations.\n\n"
+            f"Original prompt:\n{base_prompt}\n\n"
+            "These visual QA items were answered incorrectly by the current video:\n"
+            f"{qa_block}\n\n"
+            "Now provide the rewritten prompt:"
+        )
+
+        # 4) 调用 Qwen-VL 做纯文本生成
+        messages = [{
+            "role": "user",
+            "content": [{"type": "text", "text": prompt_text}],
+        }]
+
+        # 这里单独指定 max_new_tokens，避免影响 VQA 生成配置
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+        inputs = {k: (v.to(self.model.device) if hasattr(v, "to") else v)
+                  for k, v in inputs.items()}
+
+        gen_kwargs = dict(self.generation_kwargs)
+        gen_kwargs["max_new_tokens"] = max_new_tokens
+
+        cm = torch.autocast("cuda", dtype=self.model.dtype) if torch.cuda.is_available() else torch.no_grad()
+        with cm:
+            out = self.model.generate(**inputs, **gen_kwargs)
+
+        trimmed = [o[len(i):] for i, o in zip(inputs["input_ids"], out)]
+        new_prompt = self.processor.batch_decode(
+            trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )[0].strip()
+        
+        if not new_prompt:
+            print(f"Warning! Rewrite model is now unreachable.")
+        return new_prompt or base_prompt
+    
+    def rewrite_teacher_prompts_pair(
+        self,
+        prompt_a: str,
+        prompt_b: str,
+        qa_items: List[Dict[str, Any]],
+        max_new_tokens: int = 2048,
+    ) -> Tuple[str, str]:
+
+        wrong_items = [it for it in (qa_items or []) if not it.get("match")]
+        if not wrong_items:
+            return prompt_a, prompt_b
+
+        # 构造 QA 文本块
+        lines = []
+        for i, it in enumerate(wrong_items, 1):
+            q = str(it.get("question", "")).strip()
+            exp_list = it.get("expected") or []
+            if isinstance(exp_list, str):
+                exp_list = [exp_list]
+            exp_str = " / ".join(exp_list)
+            line = f"{i}. Q: {q}\n   Expected answer: {exp_str}"
+            lines.append(line)
+        qa_block = "\n".join(lines)
+
+        prompt_text = (
+            "You are a video prompt rewriting assistant.\n\n"
+            "The video has TWO segments in time order:\n"
+            " - Prompt A describes the EARLY part of the video.\n"
+            " - Prompt B describes the LATER part of the video after a transition.\n\n"
+            "Goal:\n"
+            "Given the original Prompt A and Prompt B, and several visual QA items that "
+            "are currently answered incorrectly, rewrite BOTH prompts so that the desired "
+            "visual conditions become explicit.\n\n"
+            "Requirements:\n"
+            "1. Preserve the main story, characters and setting of both prompts as much as possible.\n"
+            "2. For each \"Q / Expected\", decide whether it refers mainly to the early segment (A), "
+            "the later segment (B), or both. Then inject the expected visual condition into the appropriate prompt.\n"
+            "3. Keep the temporal structure: A happens before B.\n"
+            "4. Do NOT mention words like 'QA', 'evaluation', 'model', 'score'; "
+            "only describe what should appear in the video.\n"
+            "5. Output in the following format ONLY:\n"
+            "   Prompt A: <rewritten prompt A on one line>\n"
+            "   Prompt B: <rewritten prompt B on one line>\n\n"
+            "For EVERY QA item listed below:\n"
+            "- If the expected answer is 'yes':\n"
+            "You MUST ensure that the described event HAPPENS in the video, and you MUST explicitly describe this event in the rewritten prompt.\n"
+            "- If the expected answer is 'no':\n"
+            "You MUST ensure that this event does NOT happen in the video, and you MUST make the absence clear in the prompt if needed.\n"
+            "Do not skip any QA. Every QA must influence the rewritten prompt.\n\n"
+            f"Original Prompt A:\n{prompt_a}\n\n"
+            f"Original Prompt B:\n{prompt_b}\n\n"
+            "These visual QA items were answered incorrectly by the current video:\n"
+            f"{qa_block}\n\n"
+            "Now provide the rewritten prompts:\n"
+            "Prompt A:"
+        )
+
+        messages = [{
+            "role": "user",
+            "content": [{"type": "text", "text": prompt_text}],
+        }]
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+        inputs = {k: (v.to(self.model.device) if hasattr(v, "to") else v)
+                for k, v in inputs.items()}
+
+        gen_kwargs = dict(self.generation_kwargs)
+        gen_kwargs["max_new_tokens"] = max_new_tokens
+
+        cm = torch.autocast("cuda", dtype=self.model.dtype) if torch.cuda.is_available() else torch.no_grad()
+        with cm:
+            out = self.model.generate(**inputs, **gen_kwargs)
+
+        trimmed = [o[len(i):] for i, o in zip(inputs["input_ids"], out)]
+        full_text = self.processor.batch_decode(
+            trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )[0].strip()
+
+        # 简单解析 Prompt A / B
+        new_a, new_b = prompt_a, prompt_b
+        if "Prompt B:" in full_text:
+            parts = full_text.split("Prompt B:", 1)
+            a_part = parts[0].replace("Prompt A:", "").strip()
+            b_part = parts[1].strip()
+            if a_part:
+                new_a = a_part
+            if b_part:
+                new_b = b_part
+        else:
+            # 万一只返回了一段，就默认当 A 用
+            if full_text:
+                new_a = full_text
+
+        return new_a, new_b
 
     # ---------- internals ----------
     def _ensure_model_name(self):

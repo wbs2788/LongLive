@@ -27,7 +27,7 @@ global_sink: false
 context_noise: 0
 
 generator_ckpt: longlive_models/models/longlive_base.pt
-lora_ckpt: longlive_models/models/lora.pt
+lora_ckpt: log_new_qa/checkpoint_model_002300/model.pt
 
 adapter:
   type: "lora"

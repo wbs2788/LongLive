@@ -404,6 +404,7 @@ class StreamingTrainingModel:
             print(f"[StreamingTrain-Model] can_generate_more: current_length={current_length}, temp_max_length={temp_max_length}, global_max_length={self.max_length}, can_generate={can_generate}")
             
         return can_generate
+    
     def generate_next_chunk(self, requires_grad: bool = True) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Generate the next chunk, supporting overlap to ensure temporal continuity.
@@ -568,36 +569,109 @@ class StreamingTrainingModel:
 
         # Fetch conditional_dict for loss computation
         chunk_start_frame = chunk_info["chunk_start_frame"]
+
+        cond_info = self.state["conditional_info"]
         conditional_dict = self._get_current_conditional_dict(chunk_start_frame)
-        unconditional_dict = self.state["conditional_info"]["unconditional_dict"]
-        
-        # Fetch gradient_mask to compute loss only on newly generated frames
+        unconditional_dict = cond_info["unconditional_dict"]
+
+        # ---------------- teacher prompt 覆盖逻辑（统一用 prompt / switch 命名） ----------------
+        teacher_main = cond_info.get("teacher_conditional_dict")              # 对应 prompt_text
+        teacher_switch = cond_info.get("teacher_switch_conditional_dict")     # 对应 switch_prompt_text
+
+        switch_info = cond_info.get("switch_info", {})
+        switch_frame_index = switch_info.get("switch_frame_index")
+
+        if teacher_main is not None or teacher_switch is not None:
+            # 没有 switch，或者根本没 teacher_switch，就一律用 teacher_main
+            if switch_frame_index is None or teacher_switch is None:
+                if teacher_main is not None:
+                    conditional_dict = teacher_main
+            else:
+                # 有 switch：根据 chunk_start_frame 在 switch 前/后决定用哪个 teacher
+                if chunk_start_frame < switch_frame_index:
+                    if teacher_main is not None:
+                        conditional_dict = teacher_main
+                    elif teacher_switch is not None:
+                        conditional_dict = teacher_switch
+                else:
+                    if teacher_switch is not None:
+                        conditional_dict = teacher_switch
+                    elif teacher_main is not None:
+                        conditional_dict = teacher_main
+        # -------------------------------------------------------------------
+
         gradient_mask = chunk_info.get("gradient_mask", None)
-        
-        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-            print(f"[StreamingTrain-Model] Using conditional_dict and unconditional_dict for loss calculation at frame {chunk_start_frame}")
-        
-        # Compute DMD loss
+
         dmd_loss, dmd_log_dict = self.base_model.compute_distribution_matching_loss(
             image_or_video=chunk,
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
-            gradient_mask=gradient_mask,  # Pass gradient_mask
+            gradient_mask=gradient_mask,
             denoised_timestep_from=chunk_info["denoised_timestep_from"],
-            denoised_timestep_to=chunk_info["denoised_timestep_to"]
+            denoised_timestep_to=chunk_info["denoised_timestep_to"],
         )
         
+        lambda_teacher = getattr(self.config.grpo, "lambda_teacher", 0.0)
+
+        if lambda_teacher > 0.0:
+            # 2.1 兼容你现在的实现：单一 teacher_conditional_dict
+            teacher_cond = cond_info.get("teacher_conditional_dict", None)
+
+            # 2.2 如果没有单一 dict，则兼容“prompt / switch 两个 teacher”
+            if teacher_cond is None:
+                if (not dist.is_initialized() or dist.get_rank() == 0):
+                    print(f"[StreamingTrain-Model] WARNING: 'teacher_conditional_dict' missing in cond_info. Keys found: {list(cond_info.keys())}")
+                switch_info = cond_info.get("switch_info", {})
+                switch_frame = switch_info.get("switch_frame_index", None)
+
+                if switch_frame is None:
+                    # 没有 switch：优先用 teacher_prompt，其次 fallback 到 teacher_switch
+                    teacher_cond = (
+                        cond_info.get("teacher_conditional_prompt")
+                        or cond_info.get("teacher_conditional_switch")
+                    )
+                else:
+                    # 有 switch：根据 chunk_start_frame 决定用哪一边的 teacher
+                    if chunk_start_frame < switch_frame:
+                        teacher_cond = cond_info.get("teacher_conditional_prompt")
+                    else:
+                        teacher_cond = cond_info.get("teacher_conditional_switch")
+
+        if teacher_cond is not None and lambda_teacher > 0.0:
+            # 记录一下 student 本身的 loss（detach 一下，避免占计算图）
+            dmd_log_dict["generator_loss_student"] = dmd_loss.detach()
+
+            dmd_teacher, _ = self.base_model.compute_distribution_matching_loss(
+                image_or_video=chunk,            # 注意：同一个 chunk
+                conditional_dict=teacher_cond,   # teacher 条件
+                unconditional_dict=unconditional_dict,
+                gradient_mask=gradient_mask,
+                denoised_timestep_from=chunk_info["denoised_timestep_from"],
+                denoised_timestep_to=chunk_info["denoised_timestep_to"],
+            )
+            dmd_loss = dmd_loss + lambda_teacher * dmd_teacher
+
+            dmd_log_dict["generator_loss_teacher"] = dmd_teacher.detach()
+
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
-            log_gpu_memory(f"StreamingTrain-Model: After DMD loss computation", device=self.device, rank=dist.get_rank() if dist.is_initialized() else 0)
-        
+            log_gpu_memory(
+                f"StreamingTrain-Model: After DMD loss computation",
+                device=self.device,
+                rank=dist.get_rank() if dist.is_initialized() else 0,
+            )
+
         # Update log dict
-        dmd_log_dict.update({
-            "loss_time": time.time() - _t_loss_start,
-            "new_frames_supervised": chunk_info.get("new_frames_generated", chunk.shape[1]),
-        })
-        
+        dmd_log_dict.update(
+            {
+                "loss_time": time.time() - _t_loss_start,
+                "new_frames_supervised": chunk_info.get(
+                    "new_frames_generated", chunk.shape[1]
+                ),
+            }
+        )
+
         return dmd_loss, dmd_log_dict
-    
+        
     def _clear_cache_gradients(self):
         """
         Clear possible gradient references in KV cache and cross-attention cache.
@@ -839,7 +913,7 @@ class StreamingTrainingModel:
                 "previous_frames": None if self.state["previous_frames"] is None
                                     else self.state["previous_frames"].detach().clone(),
                 "temp_max_length": self.state["temp_max_length"],
-                "conditional_info": self.state["conditional_info"],  # 只读 dict 可浅拷贝
+                "conditional_info": self.state["conditional_info"].copy() if self.state["conditional_info"] else None,
             },
             "kv": None,
             "xattn": None,

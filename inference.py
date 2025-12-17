@@ -236,12 +236,17 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         else:
             model_type = "regular"
             
+        base_prompt_for_name = prompt  # 就用 dataset['prompts'] 里的原文
+
+        # 简单健检查：有极少数系统不喜欢路径分隔符
+        base_prompt_for_name = base_prompt_for_name.replace('/', '').replace('\\', '')
+        for bad in ('/', '\\'):
+            assert bad not in base_prompt_for_name, f"prompt 含有非法字符 {bad}，会影响文件名：{base_prompt_for_name}"
+        if len(base_prompt_for_name) > 40:
+            base_prompt_for_name = base_prompt_for_name[:40]
         for seed_idx in range(config.num_samples):
-            # All processes save their videos
-            if config.save_with_index:
-                output_path = os.path.join(config.output_folder, f'rank{rank}-{idx}-{seed_idx}_{model_type}.mp4')
-            else:
-                output_path = os.path.join(config.output_folder, f'rank{rank}-{prompt[:100]}-{seed_idx}.mp4')
+            out_name = f"{base_prompt_for_name}-{seed_idx}.mp4"   # 核心：严格的字面量命名
+            output_path = os.path.join(config.output_folder, out_name)
             write_video(output_path, video[seed_idx], fps=16)
 
     if config.inference_iter != -1 and i >= config.inference_iter:
