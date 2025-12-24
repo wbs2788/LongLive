@@ -13,19 +13,19 @@ model_kwargs:
 
 
 # inference
-data_path: /picassox/intelligent-cpfs/digital-human/intern_digital-human/Reward-Forcing/prompts/MovieGenVideoBench_extended.txt
-output_folder: videos/long_prompt_refined_MovieGenBench
+data_path: prompts/vbench.txt
+output_folder: videos/prompt_refine_new_dynamic_3k
 inference_iter: -1
-num_output_frames: 120
+num_output_frames: 21
 use_ema: false
-seed: 0
-num_samples: 1
+seed: 42
+num_samples: 5
 save_with_index: true
 global_sink: true
 context_noise: 0
 
 generator_ckpt: longlive_models/models/longlive_base.pt
-lora_ckpt: log_new_qa/checkpoint_model_002300/model.pt
+lora_ckpt: log_new_qa/checkpoint_model_003000/model.pt
 
 adapter:
   type: "lora"

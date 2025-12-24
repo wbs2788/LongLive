@@ -1517,6 +1517,16 @@ class Trainer:
         self.streaming_model.load_snapshot(snap_teacher)
         self._set_all_seeds(seeds[best_idx])
         best_chunk, best_info = self.streaming_model.generate_next_chunk(requires_grad=False)
+        
+        all_motion_scores = [float(res.get("motion_score", 0.0)) for res in judge_results]
+        all_consis_scores = [float(res.get("consistency", 0.0)) for res in judge_results]
+        all_final_scores  = [float(res.get("final_score", 0.0)) for res in judge_results] # 其实就是 final_scores
+
+        motion_mean = torch.tensor(all_motion_scores).mean().item()
+        consis_mean = torch.tensor(all_consis_scores).mean().item()
+        
+        best_motion = all_motion_scores[best_idx]
+        best_consis = all_consis_scores[best_idx]
 
         log = {
             "generator_loss": torch.tensor(total_loss_detached, device=self.device),
@@ -1528,9 +1538,17 @@ class Trainer:
             "grpo_weight_max": torch.stack(w_list).max().item(),
             "grpo_best_idx": best_idx,
             "grpo_best_pr": R[best_idx].item(),
-            "grpo_final_scores": final_scores,
+            
+            "grpo_final_scores": final_scores, 
             "grpo_weights": [w.item() for w in w_list],
             "grpo_low_std_fallback": 0,
+
+            "grpo_motion_scores": all_motion_scores,   # 传列表
+            "grpo_consis_scores": all_consis_scores,   # 传列表
+            "grpo_motion_mean": motion_mean,
+            "grpo_consis_mean": consis_mean,
+            "grpo_best_motion": best_motion,           # 看看赢家动不动
+            "grpo_best_consis": best_consis,
         }
         return log, best_chunk.detach(), best_info
 
@@ -1847,6 +1865,23 @@ class Trainer:
                                 wandb_loss_dict["grpo/best_idx"]  = generator_log_dict.get("grpo_best_idx", -1)
                                 wandb_loss_dict["grpo/best_pr"] = generator_log_dict.get("grpo_best_pr", 0.0)
 
+                                # 1. 记录平均分 (Scalar)
+                                wandb_loss_dict["grpo/motion_mean"] = generator_log_dict.get("grpo_motion_mean", 0.0)
+                                wandb_loss_dict["grpo/consistency_mean"] = generator_log_dict.get("grpo_consis_mean", 0.0)
+                                
+                                # 2. 记录 Best Candidate 的表现 (Scalar) - 这个最直观
+                                wandb_loss_dict["grpo/best_candidate_motion"] = generator_log_dict.get("grpo_best_motion", 0.0)
+                                wandb_loss_dict["grpo/best_candidate_consistency"] = generator_log_dict.get("grpo_best_consis", 0.0)
+
+                                # 3. 记录分布直方图 (Histogram) - 也就是"所有分数"
+                                motion_list = generator_log_dict.get("grpo_motion_scores", None)
+                                consis_list = generator_log_dict.get("grpo_consis_scores", None)
+                                
+                                if motion_list:
+                                    wandb_loss_dict["grpo/dist_motion_score"] = wandb.Histogram(motion_list)
+                                if consis_list:
+                                    wandb_loss_dict["grpo/dist_consistency"] = wandb.Histogram(consis_list)
+                                    
                                 # 列表 -> 直方图（需要 wandb 已 import）
                                 prs = generator_log_dict.get("grpo_pass_rates", None)
                                 fss = generator_log_dict.get("grpo_final_scores", None)

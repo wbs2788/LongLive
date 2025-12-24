@@ -204,6 +204,20 @@ class QwenVLJudge(VideoQAJudge):
     def score(self, video_rgb: torch.Tensor, qa_list: List[Dict[str, Any]]) -> Dict[str, Any]:
         mode = (getattr(self.cfg, "scoring_mode", "full") or "full").lower()
 
+        if video_rgb is not None and video_rgb.numel() > 0:
+            vid_t = video_rgb.detach().float()
+            if vid_t.max() > 1.0:
+                vid_t = vid_t / 255.0
+            
+            if vid_t.shape[-1] == 3: # [T, H, W, C] -> [T, C, H, W]
+                vid_t = vid_t.permute(0, 3, 1, 2)
+                
+            diffs = torch.abs(vid_t[1:] - vid_t[:-1])
+            motion_score = diffs.mean().item()
+        else:
+            motion_score = 0.0
+        
+
         frames = self._sample_frames(video_rgb, self.cfg.max_frames, self.cfg.vision_resize)
         if not frames:
             items = [{"question": qa.get("question",""), "expected": qa.get("answer",""),
@@ -289,32 +303,31 @@ class QwenVLJudge(VideoQAJudge):
             if self.cfg.all_correct_bonus > 0.0 and num_total > 0 and num_correct == num_total:
                 base_pass = min(1.0, base_pass * (1.0 + self.cfg.all_correct_bonus))
 
-        # ---------- Consistency 路径（qa_only 跳过） ----------
         consis = 1.0  # 对于 qa_only，我们把一致性视为中性 1（不影响最终分）
+        motion_factor = 1.0
         if mode != "qa_only":
-            consis = self._ask_consistency(frames, self.cfg.consistency_question)  # 1/0
+            consis = self._ask_consistency(frames, self.cfg.consistency_question)
+        
+        REF_MOTION = 0.025
+        motion_factor = motion_score / REF_MOTION
+        motion_factor = max(0.1, min(motion_factor, 3.0))
 
-        # ---------- 组合为最终分 ----------
         if mode == "qa_only":
-            # 只用 QA 题通过率
-            final_score = base_pass
+            final_score = base_pass * motion_factor # 加上惩罚
             pass_rate   = base_pass
         elif mode == "consistency_only":
-            # 只用一致性，YES=1/NO=0
-            final_score = float(consis)
+            final_score = float(consis) * motion_factor # 加上惩罚
             pass_rate   = float(consis)
-            # QA 统计清零/保持默认
-            items = []
-            num_correct = 0
-            num_total = 0
         else:
-            # full：与你原先一致（硬门控或软融合）
+            # full mode
             if self.cfg.consis_hard_gate:
                 final_score = base_pass * (1.0 if consis == 1 else 0.0)
             else:
                 alpha = 1.0 if consis == 1 else float(self.cfg.consis_alpha_if_no)
                 final_score = base_pass * alpha
-            pass_rate = base_pass  # 保持对外兼容：pass_rate 是纯 QA 的通过率
+            pass_rate = base_pass
+            # ★★★ 最终应用动态惩罚 ★★★
+            final_score = final_score * motion_factor
 
         return {
             "mode": mode,
@@ -323,6 +336,8 @@ class QwenVLJudge(VideoQAJudge):
             "num_total": int(num_total),
             "consistency": int(consis),
             "final_score": float(final_score),
+            "motion_score": motion_score, 
+            "motion_factor": motion_factor, 
             "items": items,
         }
 
@@ -372,6 +387,7 @@ class QwenVLJudge(VideoQAJudge):
             "3. Do NOT mention words like 'QA', 'evaluation', 'model', 'score', etc.; "
             "only describe what should appear in the video.\n"
             "4. Output only ONE rewritten prompt, without explanations.\n\n"
+            "3. CRITICAL: You MUST include words implying MOTION and DYNAMICS (e.g., 'moving', 'walking', 'running', 'camera panning', 'dynamic shot'). The video must NOT be static if original prompt doesn't metion.\n"
             f"Original prompt:\n{base_prompt}\n\n"
             "These visual QA items were answered incorrectly by the current video:\n"
             f"{qa_block}\n\n"
@@ -411,6 +427,11 @@ class QwenVLJudge(VideoQAJudge):
         
         if not new_prompt:
             print(f"Warning! Rewrite model is now unreachable.")
+
+        force_suffix = ", high dynamic motion, cinematography, action shot, 4k"
+        if not new_prompt.endswith(force_suffix):
+            new_prompt += force_suffix
+            
         return new_prompt or base_prompt
     
     def rewrite_teacher_prompts_pair(
