@@ -1,5 +1,3 @@
-# Adopted from https://github.com/guandeh17/Self-Forcing
-# SPDX-License-Identifier: CC-BY-NC-SA-4.0
 import argparse
 import torch
 import os
@@ -11,14 +9,71 @@ from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
+from datasets import load_from_disk, load_dataset # Added for HF datasets
 
 from pipeline import (
     CausalInferencePipeline,
 )
-from utils.dataset import TextDataset
+# from utils.dataset import TextDataset # No longer needed
 from utils.misc import set_seed
 
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
+
+# ----------------- New Dataset Wrapper -----------------
+class HFDatasetWrapper(torch.utils.data.Dataset):
+    def __init__(self, dataset_path):
+        print(f"Loading dataset from: {dataset_path}")
+        try:
+            # Try loading as a saved arrow dataset (load_from_disk)
+            self.data = load_from_disk(dataset_path)["test"]
+        except Exception:
+            try:
+                # Fallback: try loading as a directory/script
+                self.data = load_dataset(dataset_path)["test"]
+            except Exception as e:
+                print(f"Error loading dataset: {e}")
+                raise e
+
+        # Handle DatasetDict (if 'train' split exists)
+        if hasattr(self.data, 'keys') and not hasattr(self.data, 'features'):
+            if 'train' in self.data.keys():
+                self.data = self.data['train']
+            else:
+                # Fallback to the first available split
+                key = list(self.data.keys())[0]
+                self.data = self.data[key]
+        
+        # Automatically determine the text column name
+        self.text_col = 'text'
+        if len(self.data) > 0:
+            sample = self.data[0]
+            # Common names for text-to-video datasets
+            candidates = ['prompt', 'caption', 'text', 'prompts', 'long_prompt']
+            for c in candidates:
+                if c in sample:
+                    self.text_col = c
+                    break
+        
+        print(f"Dataset loaded. Size: {len(self.data)}. Using column '{self.text_col}' for prompts.")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        prompt_text = item[self.text_col]
+        
+        # Ensure it's a string
+        if not isinstance(prompt_text, str):
+            prompt_text = str(prompt_text)
+
+        # Return dict matching original TextDataset format
+        return {
+            'idx': idx,
+            'prompts': prompt_text,
+            'extended_prompts': prompt_text # Use same text if no extension logic exists
+        }
+# -------------------------------------------------------
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -103,7 +158,7 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
     if local_rank == 0:
         print(f"LoRA enabled with config: {config.adapter}")
         print("Applying LoRA to generator (inference)...")
-    # 在加载基础权重后，对 generator 的 transformer 模型应用 LoRA 包装
+    # Apply LoRA to generator transformer
     pipeline.generator.model = configure_lora_for_model(
         pipeline.generator.model,
         model_name="generator",
@@ -111,13 +166,13 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
         is_main_process=(local_rank == 0),
     )
 
-    # 加载 LoRA 权重（如果提供了 lora_ckpt）
+    # Load LoRA weights (if provided)
     lora_ckpt_path = getattr(config, "lora_ckpt", None)
     if lora_ckpt_path:
         if local_rank == 0:
             print(f"Loading LoRA checkpoint from {lora_ckpt_path}")
         lora_checkpoint = torch.load(lora_ckpt_path, map_location="cpu")
-        # 兼容包含 `generator_lora` 键或直接是 LoRA state dict 两种格式
+        
         if isinstance(lora_checkpoint, dict) and "generator_lora" in lora_checkpoint:
             peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint["generator_lora"])  # type: ignore
         else:
@@ -138,10 +193,11 @@ if low_memory:
 pipeline.generator.to(device=device)
 pipeline.vae.to(device=device)
 
-extended_prompt_path = config.data_path
-dataset = TextDataset(prompt_path=config.data_path, extended_prompt_path=extended_prompt_path)
+# ----------------- Modified: Load Local HuggingFace Dataset -----------------
+dataset_path = "../wbs/moviegen"
+dataset = HFDatasetWrapper(dataset_path)
 num_prompts = len(dataset)
-print(f"Number of prompts: {num_prompts}")
+# ----------------------------------------------------------------------------
 
 if dist.is_initialized():
     sampler = DistributedSampler(dataset, shuffle=False, drop_last=True)
@@ -169,23 +225,24 @@ def encode(self, videos: torch.Tensor) -> torch.Tensor:
     output = torch.stack(output, dim=0)
     return output
 
-
-for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
+# ----------------- Modified: TQDM Progress Bar -----------------
+# Added `total=len(dataloader)` and `desc` for better visibility
+for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), desc="Generating Videos", disable=(local_rank != 0)):
     idx = batch_data['idx'].item()
 
     # For DataLoader batch_size=1, the batch_data is already a single item, but in a batch container
-    # Unpack the batch data for convenience
     if isinstance(batch_data, dict):
         batch = batch_data
     elif isinstance(batch_data, list):
         batch = batch_data[0]  # First (and only) item in the batch
+    
     prompt = batch['prompts'][0]
 
     check_base_name = prompt.replace('/', '').replace('\\', '')
     if len(check_base_name) > 40:
         check_base_name = check_base_name[:40]
     
-    # 检查当前 prompt 下的所有 seed 是否都已经生成过
+    # Check if all seeds for this prompt exist
     all_files_exist = True
     for seed_idx in range(config.num_samples):
         check_filename = f"{check_base_name}-{seed_idx}.mp4"
@@ -196,7 +253,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     
     if all_files_exist:
         if local_rank == 0:
-            print(f"Skipping existing: {check_base_name}...")
+            # print(f"Skipping existing: {check_base_name}...") # Optional: Comment out to reduce spam in progress bar
+            pass
         continue
     
     all_video = []
@@ -204,7 +262,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     # For text-to-video, batch is just the text prompt
     extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
-    if extended_prompt is not None:
+    if extended_prompt is not None and len(extended_prompt) > 0:
         prompts = [extended_prompt] * config.num_samples
     else:
         prompts = [prompt] * config.num_samples
@@ -213,14 +271,9 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         [config.num_samples, config.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
     )
 
-    print("sampled_noise.device", sampled_noise.device)
-    # print("initial_latent.device", initial_latent.device)
-    print("prompts", prompts)
-    # Generate 81 frames
-    # print('sampled_noise.shape', sampled_noise.shape, 'prompts', prompts)
-    # print('pipeline.generator', pipeline.generator)
-    # print('pipeline.text_encoder', pipeline.text_encoder)
-    # print('pipeline.vae', pipeline.vae)
+    # Clean up logs to keep progress bar clean
+    # print("sampled_noise.device", sampled_noise.device)
+    # print("prompts", prompts)
 
     video, latents = pipeline.inference(
         noise=sampled_noise,
@@ -246,7 +299,6 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     # Save the video if the current prompt is not a dummy prompt
     if idx < num_prompts:
-        # Determine model type for filename
         if hasattr(pipeline, 'is_lora_enabled') and pipeline.is_lora_enabled:
             model_type = "lora"
         elif getattr(config, 'use_ema', False):
@@ -254,20 +306,22 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         else:
             model_type = "regular"
             
-        base_prompt_for_name = prompt  # 就用 dataset['prompts'] 里的原文
+        base_prompt_for_name = prompt 
 
-        # 简单健检查：有极少数系统不喜欢路径分隔符
+        # Sanitize filename
         base_prompt_for_name = base_prompt_for_name.replace('/', '').replace('\\', '')
         for bad in ('/', '\\'):
-            assert bad not in base_prompt_for_name, f"prompt 含有非法字符 {bad}，会影响文件名：{base_prompt_for_name}"
+            assert bad not in base_prompt_for_name, f"prompt contains illegal chars {bad}"
         if len(base_prompt_for_name) > 40:
             base_prompt_for_name = base_prompt_for_name[:40]
+            
         for seed_idx in range(config.num_samples):
-            out_name = f"{base_prompt_for_name}-{seed_idx}.mp4"   # 核心：严格的字面量命名
+            out_name = f"{base_prompt_for_name}-{seed_idx}.mp4" 
             output_path = os.path.join(config.output_folder, out_name)
             write_video(output_path, video[seed_idx], fps=16)
 
     if config.inference_iter != -1 and i >= config.inference_iter:
         break
+        
 if dist.is_initialized():
     dist.destroy_process_group()

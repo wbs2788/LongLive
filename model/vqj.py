@@ -308,8 +308,8 @@ class QwenVLJudge(VideoQAJudge):
         if mode != "qa_only":
             consis = self._ask_consistency(frames, self.cfg.consistency_question)
         
-        REF_MOTION = 0.025
-        motion_factor = motion_score / REF_MOTION
+        REF_MOTION = 0.02
+        motion_factor = (motion_score / REF_MOTION) ** 2
         motion_factor = max(0.1, min(motion_factor, 3.0))
 
         if mode == "qa_only":
@@ -375,23 +375,18 @@ class QwenVLJudge(VideoQAJudge):
 
         # 3) 构造让 Qwen 改写的 meta-prompt
         prompt_text = (
-            "You are a video prompt rewriting assistant.\n\n"
+            "You are a video prompt refinement assistant.\n\n"
             "Goal:\n"
-            "Given an original video generation instruction and several visual QA items "
-            "that are currently answered incorrectly, rewrite the instruction so that "
-            "the desired visual conditions become explicit.\n\n"
+            "Refine the original prompt to include missing visual details (based on QA) and ensure dynamic motion, while STRICTLY preserving the original content.\n\n"
             "Requirements:\n"
-            "1. Preserve the main story, characters and setting of the original prompt as much as possible.\n"
-            "2. For each \"Q / Expected\", turn the expected answer into a clear visual condition "
-            "and explicitly incorporate it into the new prompt.\n"
-            "3. Do NOT mention words like 'QA', 'evaluation', 'model', 'score', etc.; "
-            "only describe what should appear in the video.\n"
-            "4. Output only ONE rewritten prompt, without explanations.\n\n"
-            "3. CRITICAL: You MUST include words implying MOTION and DYNAMICS (e.g., 'moving', 'walking', 'running', 'camera panning', 'dynamic shot'). The video must NOT be static if original prompt doesn't metion.\n"
+            "1. **STRICT PRESERVATION**: You must keep the original prompt's structure, vocabulary, and artistic style EXACTLY as is. Do NOT rephrase, summarize, or remove any existing words. Your job is to *insert* missing details, not to rewrite the story.\n"
+            "2. **Targeted Injection**: For each 'Q / Expected' item, seamless INSERT short, specific visual keywords into the original text to satisfy the condition. Do not alter the surrounding context.\n"
+            "3. **Force Dynamics**: Ensure the prompt explicitly describes MOTION. If the original prompt is static, you MUST append a motion descriptor (e.g., 'slow motion', 'dynamic camera pan', 'moving subject') that fits the scene. Do not let the video be static.\n"
+            "4. Output only ONE final prompt, without explanations.\n\n"
             f"Original prompt:\n{base_prompt}\n\n"
-            "These visual QA items were answered incorrectly by the current video:\n"
+            "Visual QA items to fix:\n"
             f"{qa_block}\n\n"
-            "Now provide the rewritten prompt:"
+            "Refined prompt:"
         )
 
         # 4) 调用 Qwen-VL 做纯文本生成
@@ -804,6 +799,7 @@ class QwenVLVLLMJudge(VideoQAJudge):
             "that are currently answered incorrectly, rewrite the instruction so that "
             "the desired visual conditions become explicit.\n\n"
             "Requirements:\n"
+            "CRITICAL: You MUST strictly PRESERVE all visual details describing the BACKGROUND, SCENE, lighting, and environment from the original prompt. Do NOT delete any scene keywords.\n"
             "1. Preserve the main story, characters and setting of the original prompt as much as possible.\n"
             "2. For each \"Q / Expected\", turn the expected answer into a clear visual condition "
             "and explicitly incorporate it into the new prompt.\n"

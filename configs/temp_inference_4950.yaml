@@ -14,7 +14,7 @@ model_kwargs:
 
 # inference
 data_path: prompts/vbench.txt
-output_folder: videos_moviegen/prompt_refine_new_dynamic_4.9k
+output_folder: videos_moviegen/step_4950
 inference_iter: -1
 num_output_frames: 21
 use_ema: false
@@ -25,7 +25,7 @@ global_sink: true
 context_noise: 0
 
 generator_ckpt: longlive_models/models/longlive_base.pt
-lora_ckpt: log_new_qa/checkpoint_model_004900/model.pt
+lora_ckpt: log_new_qa/checkpoint_model_004950/model.pt
 
 adapter:
   type: "lora"

@@ -2,7 +2,7 @@ __pycache__
 
 longlive_models
 wan_models
-videos
+videos*
 log*
 *logs
 checkpoints
@@ -11,3 +11,4 @@ vis
 wandb
 .vscode
 vqj_*
+*.mp4
